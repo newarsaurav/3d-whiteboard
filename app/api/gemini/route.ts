@@ -1,30 +1,768 @@
-import { GoogleGenAI } from "@google/genai";
+import {
+  FunctionCallingConfigMode,
+  GoogleGenAI,
+  type FunctionDeclaration,
+  type Part,
+} from "@google/genai";
 import { NextResponse } from "next/server";
+
+import type {
+  BoardChartCommand,
+  BoardCommand,
+  BoardFlowchartCommand,
+  BoardImageCommand,
+  BoardTextCommand,
+  FlowchartEdge,
+  FlowchartNode,
+} from "@/types/board";
 
 export const runtime = "nodejs";
 
 interface GeminiRequestBody {
   prompt?: unknown;
+  boardImage?: unknown;
+  currentCommand?: unknown;
+}
+
+interface GeocodingResult {
+  name?: string;
+  latitude?: number;
+  longitude?: number;
+  timezone?: string;
+  country?: string;
+  admin1?: string;
+}
+
+interface GeocodingResponse {
+  results?: GeocodingResult[];
+}
+
+interface WeatherDaily {
+  time?: string[];
+  temperature_2m_max?: Array<number | null>;
+  temperature_2m_mean?: Array<number | null>;
+  temperature_2m_min?: Array<number | null>;
+  precipitation_sum?: Array<number | null>;
+  wind_speed_10m_max?: Array<number | null>;
+}
+
+interface WeatherResponse {
+  timezone?: string;
+  daily?: WeatherDaily;
+}
+
+const MAX_PROMPT_LENGTH = 3000;
+const MAX_CONTEXT_LENGTH = 18000;
+
+const writeTextDeclaration: FunctionDeclaration = {
+  name: "write_text",
+  description:
+    "Write a concise explanation, definition, lesson, or bullet-point answer on the whiteboard. Use this for theory and factual explanations. For a follow-up edit to existing text, return the COMPLETE updated text content, not only the change.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      title: {
+        type: "string",
+        description: "Short whiteboard title, ideally under 8 words.",
+      },
+      bullets: {
+        type: "array",
+        description:
+          "Two to eight short teaching bullets. Keep each bullet concise enough to fit on a 1600x900 whiteboard.",
+        items: {
+          type: "string",
+        },
+      },
+      note: {
+        type: "string",
+        description:
+          "Optional one-line takeaway, formula, or important note.",
+      },
+    },
+    required: ["title", "bullets"],
+  },
+};
+
+const drawFlowchartDeclaration: FunctionDeclaration = {
+  name: "draw_flowchart",
+  description:
+    "Create or update a flowchart/process diagram on the whiteboard. Return the COMPLETE flowchart. Place nodes on a simple row/column grid so the app can render clean shapes and arrows itself.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      title: {
+        type: "string",
+        description: "Short flowchart title.",
+      },
+      nodes: {
+        type: "array",
+        description:
+          "Flowchart nodes. Use rows 0-5 and columns 0-3. Avoid placing two nodes in the same row and column unless absolutely necessary.",
+        items: {
+          type: "object",
+          properties: {
+            id: {
+              type: "string",
+              description: "Short unique node id such as start, login, valid.",
+            },
+            label: {
+              type: "string",
+              description: "Short text shown inside the node.",
+            },
+            row: {
+              type: "number",
+              description: "Grid row from 0 to 5.",
+            },
+            column: {
+              type: "number",
+              description: "Grid column from 0 to 3.",
+            },
+            shape: {
+              type: "string",
+              description:
+                "Node shape: rounded for normal steps, diamond for decisions, circle for compact start/end nodes.",
+            },
+          },
+          required: ["id", "label", "row", "column", "shape"],
+        },
+      },
+      edges: {
+        type: "array",
+        description: "Directed arrows connecting node ids.",
+        items: {
+          type: "object",
+          properties: {
+            from: {
+              type: "string",
+              description: "Source node id.",
+            },
+            to: {
+              type: "string",
+              description: "Destination node id.",
+            },
+            label: {
+              type: "string",
+              description: "Optional short arrow label such as Yes or No.",
+            },
+          },
+          required: ["from", "to"],
+        },
+      },
+    },
+    required: ["title", "nodes", "edges"],
+  },
+};
+
+const plotWeatherHistoryDeclaration: FunctionDeclaration = {
+  name: "plot_weather_history",
+  description:
+    "Fetch REAL recent weather data and plot it on the whiteboard. Use this whenever the user asks for historical/recent temperature, precipitation, or wind data for a real place. Never invent weather values.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      location: {
+        type: "string",
+        description:
+          "Place name to look up, for example Kathmandu, Nepal or Pokhara.",
+      },
+      days: {
+        type: "number",
+        description:
+          "Number of calendar days ending today, usually 2-30. Example: last 10 days means 10.",
+      },
+      metric: {
+        type: "string",
+        description:
+          "One of: temperature, precipitation, wind_speed.",
+      },
+      chartType: {
+        type: "string",
+        description:
+          "One of: line or bar. Prefer line for temperature/wind trends and bar for precipitation unless the user explicitly asks otherwise.",
+      },
+    },
+    required: ["location", "days", "metric", "chartType"],
+  },
+};
+
+
+const generateImageDeclaration: FunctionDeclaration = {
+  name: "generate_image",
+  description:
+    "Generate a new realistic or illustrated image for the whiteboard. Use this for requests such as draw/show/create/generate a cat, dog, person, object, scene, photo, or other visual that should look like a real image rather than a flowchart or simple diagram.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      prompt: {
+        type: "string",
+        description:
+          "A self-contained image-generation prompt describing exactly what should appear. Preserve important details from the user's request.",
+      },
+      title: {
+        type: "string",
+        description:
+          "Optional short title describing the generated image. Do not invent a title when none is useful.",
+      },
+    },
+    required: ["prompt"],
+  },
+};
+
+const editBoardImageDeclaration: FunctionDeclaration = {
+  name: "edit_board_image",
+  description:
+    "Edit the CURRENT visible whiteboard image. Use this for visual follow-ups such as add a dog beside that cat, remove the tree, change its color, make the cat bigger, move it left, or otherwise modify an image already on the board. Preserve everything the user did not ask to change.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      instruction: {
+        type: "string",
+        description:
+          "A precise edit instruction. State what to change and explicitly preserve unrelated existing board content.",
+      },
+      title: {
+        type: "string",
+        description:
+          "Optional short title for the edited image/scene.",
+      },
+    },
+    required: ["instruction"],
+  },
+};
+
+function readBoardImage(dataUrl: string): Part | null {
+  const match = dataUrl.match(
+    /^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=]+)$/,
+  );
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    inlineData: {
+      mimeType: match[1],
+      data: match[2],
+    },
+  };
+}
+
+function readString(
+  value: unknown,
+  fallback = "",
+  maxLength = 220,
+): string {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  return value
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength);
+}
+
+function readNumber(
+  value: unknown,
+  fallback: number,
+): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : fallback;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function buildTextCommand(
+  args: Record<string, unknown>,
+): BoardTextCommand {
+  const title = readString(args.title, "Lixia", 90);
+
+  const bullets = Array.isArray(args.bullets)
+    ? args.bullets
+        .map((item) => readString(item, "", 190))
+        .filter(Boolean)
+        .slice(0, 8)
+    : [];
+
+  const note = readString(args.note, "", 220);
+
+  return {
+    type: "write_text",
+    title,
+    bullets:
+      bullets.length > 0
+        ? bullets
+        : ["No whiteboard content was returned."],
+    ...(note ? { note } : {}),
+  };
+}
+
+function buildFlowchartCommand(
+  args: Record<string, unknown>,
+): BoardFlowchartCommand {
+  const rawNodes = Array.isArray(args.nodes)
+    ? args.nodes
+    : [];
+
+  const seenIds = new Set<string>();
+
+  const nodes: FlowchartNode[] = [];
+
+  for (let index = 0; index < rawNodes.length && nodes.length < 10; index += 1) {
+    const rawNode = rawNodes[index];
+
+    if (!rawNode || typeof rawNode !== "object") {
+      continue;
+    }
+
+    const node = rawNode as Record<string, unknown>;
+
+    let id = readString(node.id, `node-${index + 1}`, 36)
+      .replace(/[^a-zA-Z0-9_-]/g, "-");
+
+    if (!id) {
+      id = `node-${index + 1}`;
+    }
+
+    if (seenIds.has(id)) {
+      id = `${id}-${index + 1}`;
+    }
+
+    seenIds.add(id);
+
+    const rawShape = readString(node.shape, "rounded", 20).toLowerCase();
+    const shape =
+      rawShape === "diamond" || rawShape === "circle"
+        ? rawShape
+        : "rounded";
+
+    nodes.push({
+      id,
+      label: readString(node.label, `Step ${index + 1}`, 90),
+      row: Math.round(clamp(readNumber(node.row, index), 0, 5)),
+      column: Math.round(clamp(readNumber(node.column, 1), 0, 3)),
+      shape,
+    });
+  }
+
+  const validIds = new Set(nodes.map((node) => node.id));
+  const rawEdges = Array.isArray(args.edges)
+    ? args.edges
+    : [];
+
+  const edges: FlowchartEdge[] = rawEdges
+    .map((rawEdge) => {
+      if (!rawEdge || typeof rawEdge !== "object") {
+        return null;
+      }
+
+      const edge = rawEdge as Record<string, unknown>;
+      const from = readString(edge.from, "", 36);
+      const to = readString(edge.to, "", 36);
+      const label = readString(edge.label, "", 28);
+
+      if (!validIds.has(from) || !validIds.has(to) || from === to) {
+        return null;
+      }
+
+      return {
+        from,
+        to,
+        ...(label ? { label } : {}),
+      } satisfies FlowchartEdge;
+    })
+    .filter((edge): edge is FlowchartEdge => edge !== null)
+    .slice(0, 16);
+
+  return {
+    type: "flowchart",
+    title: readString(args.title, "Flowchart", 90),
+    nodes,
+    edges,
+  };
+}
+
+function getDateInTimeZone(timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+
+  if (!year || !month || !day) {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  return `${year}-${month}-${day}`;
+}
+
+function subtractIsoDays(isoDate: string, amount: number): string {
+  const [year, month, day] = isoDate.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+
+  date.setUTCDate(date.getUTCDate() - amount);
+
+  return date.toISOString().slice(0, 10);
+}
+
+function formatDayLabel(isoDate: string): string {
+  const date = new Date(`${isoDate}T00:00:00Z`);
+
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "numeric",
+    timeZone: "UTC",
+  }).format(date);
+}
+
+async function geocodeLocation(location: string): Promise<Required<Pick<GeocodingResult, "name" | "latitude" | "longitude">> & GeocodingResult> {
+  const url = new URL(
+    "https://geocoding-api.open-meteo.com/v1/search",
+  );
+
+  url.searchParams.set("name", location);
+  url.searchParams.set("count", "1");
+  url.searchParams.set("language", "en");
+  url.searchParams.set("format", "json");
+
+  const response = await fetch(url, {
+    cache: "no-store",
+  });
+
+  if (!response.ok) {
+    throw new Error("Could not look up that location.");
+  }
+
+  const data = (await response.json()) as GeocodingResponse;
+  const result = data.results?.[0];
+
+  if (
+    !result ||
+    typeof result.name !== "string" ||
+    typeof result.latitude !== "number" ||
+    typeof result.longitude !== "number"
+  ) {
+    throw new Error(`Could not find a location matching "${location}".`);
+  }
+
+  return {
+    ...result,
+    name: result.name,
+    latitude: result.latitude,
+    longitude: result.longitude,
+  };
+}
+
+function valueAt(
+  values: Array<number | null> | undefined,
+  index: number,
+): number | null {
+  const value = values?.[index];
+
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : null;
+}
+
+async function buildWeatherChart(
+  args: Record<string, unknown>,
+): Promise<BoardChartCommand> {
+  const locationQuery = readString(args.location, "", 120);
+
+  if (!locationQuery) {
+    throw new Error("Weather chart requires a location.");
+  }
+
+  const days = Math.round(
+    clamp(readNumber(args.days, 10), 2, 30),
+  );
+
+  const rawMetric = readString(args.metric, "temperature", 30).toLowerCase();
+  const metric =
+    rawMetric === "precipitation" || rawMetric === "wind_speed"
+      ? rawMetric
+      : "temperature";
+
+  const rawChartType = readString(args.chartType, "line", 20).toLowerCase();
+  const chartType = rawChartType === "bar" ? "bar" : "line";
+
+  const location = await geocodeLocation(locationQuery);
+  const timeZone = location.timezone || "UTC";
+  const endDate = getDateInTimeZone(timeZone);
+  const startDate = subtractIsoDays(endDate, days - 1);
+
+  const dailyVariables =
+    metric === "temperature"
+      ? "temperature_2m_max,temperature_2m_mean,temperature_2m_min"
+      : metric === "precipitation"
+        ? "precipitation_sum"
+        : "wind_speed_10m_max";
+
+  const weatherUrl = new URL(
+    "https://api.open-meteo.com/v1/forecast",
+  );
+
+  weatherUrl.searchParams.set("latitude", String(location.latitude));
+  weatherUrl.searchParams.set("longitude", String(location.longitude));
+  weatherUrl.searchParams.set("daily", dailyVariables);
+  weatherUrl.searchParams.set("timezone", "auto");
+  weatherUrl.searchParams.set("start_date", startDate);
+  weatherUrl.searchParams.set("end_date", endDate);
+
+  const weatherResponse = await fetch(weatherUrl, {
+    cache: "no-store",
+  });
+
+  if (!weatherResponse.ok) {
+    throw new Error("Open-Meteo could not return weather data.");
+  }
+
+  const weather = (await weatherResponse.json()) as WeatherResponse;
+  const dates = weather.daily?.time ?? [];
+
+  if (dates.length === 0) {
+    throw new Error("No weather data was returned for that period.");
+  }
+
+  const placeParts = [location.name, location.admin1, location.country]
+    .filter((value, index, array) =>
+      typeof value === "string" &&
+      value.trim().length > 0 &&
+      array.indexOf(value) === index,
+    ) as string[];
+
+  const placeLabel = placeParts.join(", ");
+
+  let series: BoardChartCommand["series"];
+  let title: string;
+  let yAxisLabel: string;
+  let preferredChartType: "line" | "bar" = chartType;
+
+  if (metric === "temperature") {
+    title = `${placeLabel} temperature — last ${days} days`;
+    yAxisLabel = "Temperature (°C)";
+    series = [
+      { key: "max", label: "Max", unit: "°C" },
+      { key: "mean", label: "Mean", unit: "°C" },
+      { key: "min", label: "Min", unit: "°C" },
+    ];
+  } else if (metric === "precipitation") {
+    title = `${placeLabel} precipitation — last ${days} days`;
+    yAxisLabel = "Precipitation (mm)";
+    preferredChartType = rawChartType === "line" ? "line" : "bar";
+    series = [
+      { key: "precipitation", label: "Precipitation", unit: "mm" },
+    ];
+  } else {
+    title = `${placeLabel} wind speed — last ${days} days`;
+    yAxisLabel = "Max wind speed (km/h)";
+    series = [
+      { key: "wind", label: "Max wind", unit: "km/h" },
+    ];
+  }
+
+  const data: Array<Record<string, string | number>> = [];
+
+  dates.forEach((date, index) => {
+    const row: Record<string, string | number> = {
+      label: formatDayLabel(date),
+      date,
+    };
+
+    if (metric === "temperature") {
+      const max = valueAt(weather.daily?.temperature_2m_max, index);
+      const mean = valueAt(weather.daily?.temperature_2m_mean, index);
+      const min = valueAt(weather.daily?.temperature_2m_min, index);
+
+      if (max !== null) row.max = max;
+      if (mean !== null) row.mean = mean;
+      if (min !== null) row.min = min;
+    } else if (metric === "precipitation") {
+      const precipitation = valueAt(weather.daily?.precipitation_sum, index);
+      if (precipitation !== null) row.precipitation = precipitation;
+    } else {
+      const wind = valueAt(weather.daily?.wind_speed_10m_max, index);
+      if (wind !== null) row.wind = wind;
+    }
+
+    data.push(row);
+  });
+
+  return {
+    type: "chart",
+    chartType: preferredChartType,
+    title,
+    subtitle: `${startDate} to ${endDate} • ${weather.timezone || timeZone}`,
+    xAxisLabel: "Date",
+    yAxisLabel,
+    series,
+    data,
+    source: "Open-Meteo",
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+async function buildImageCommand(
+  ai: GoogleGenAI,
+  args: Record<string, unknown>,
+  mode: "create" | "edit",
+  boardImagePart: Part | null,
+): Promise<BoardImageCommand> {
+  const title = readString(args.title, "", 90);
+
+  const requestedText =
+    mode === "edit"
+      ? readString(args.instruction, "", 1200)
+      : readString(args.prompt, "", 1200);
+
+  if (!requestedText) {
+    throw new Error(
+      mode === "edit"
+        ? "Image edit requires an instruction."
+        : "Image generation requires a prompt.",
+    );
+  }
+
+  if (mode === "edit" && !boardImagePart) {
+    throw new Error(
+      "I need the current board image before I can edit it. Please try the edit again.",
+    );
+  }
+
+  const imageInstructions =
+    mode === "edit"
+      ? `
+Edit the attached current whiteboard image according to this instruction:
+${requestedText}
+
+Rules:
+- Preserve every existing element that the user did NOT ask to change.
+- Keep the same overall 16:9 whiteboard composition.
+- Do not replace, restyle, or distort unrelated content.
+- If adding an object, place it naturally without covering important existing content.
+- Make requested animals, people, objects, and scenes visually convincing and realistic unless the user asks for another style.
+- Do not add new text, labels, borders, watermarks, or captions unless explicitly requested.
+- Return only the edited image.
+      `.trim()
+      : `
+Create an image for display on a 16:9 interactive teaching whiteboard.
+
+User request:
+${requestedText}
+
+Rules:
+- Make animals, people, objects, and scenes visually convincing and realistic unless the user asks for another style.
+- Compose the subject clearly with comfortable margins so it looks good on a whiteboard.
+- Avoid unnecessary text, labels, frames, watermarks, or captions.
+- Use a clean neutral/light background when the user does not specify a setting.
+- Return only the generated image.
+      `.trim();
+
+  const imageParts: Part[] = [{ text: imageInstructions }];
+
+  if (mode === "edit" && boardImagePart) {
+    imageParts.push(boardImagePart);
+  }
+
+  const imageResponse = await ai.models.generateContent({
+    model:
+      process.env.GEMINI_IMAGE_MODEL ??
+      "gemini-3.1-flash-image",
+    contents: [
+      {
+        role: "user",
+        parts: imageParts,
+      },
+    ],
+    config: {
+      responseModalities: ["IMAGE"],
+      responseFormat: {
+        image: {
+          aspectRatio: "16:9",
+        },
+      },
+    },
+  });
+
+  const responseParts =
+    imageResponse.candidates?.[0]?.content?.parts ?? [];
+
+  const generatedImagePart = responseParts.find(
+    (part) =>
+      typeof part.inlineData?.data === "string" &&
+      part.inlineData.data.length > 0,
+  );
+
+  const imageData = generatedImagePart?.inlineData?.data;
+
+  if (!imageData) {
+    throw new Error(
+      "The image model did not return an image.",
+    );
+  }
+
+  const mimeType =
+    generatedImagePart?.inlineData?.mimeType ||
+    "image/png";
+
+  return {
+    type: "image",
+    ...(title ? { title } : {}),
+    imageDataUrl: `data:${mimeType};base64,${imageData}`,
+    mode,
+  };
+}
+
+function serializeCurrentCommand(value: unknown): string {
+  if (!value || typeof value !== "object") {
+    return "(none)";
+  }
+
+  const command = value as Record<string, unknown>;
+
+  // Never send the generated image's base64 data back inside textual
+  // structured context. The current board screenshot is attached
+  // separately when a visual follow-up needs it.
+  if (command.type === "image") {
+    return JSON.stringify({
+      type: "image",
+      title:
+        typeof command.title === "string"
+          ? command.title.slice(0, 90)
+          : undefined,
+      mode: command.mode,
+      note:
+        "The current board contains an AI-generated image. Inspect the attached board screenshot for visual details when it is provided.",
+    });
+  }
+
+  try {
+    return JSON.stringify(value).slice(0, MAX_CONTEXT_LENGTH);
+  } catch {
+    return "(none)";
+  }
 }
 
 export async function POST(request: Request) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
-    console.log("GEMINI_API_KEY:", apiKey ? "Present" : "Missing");
+
     if (!apiKey) {
       return NextResponse.json(
-        {
-          error:
-            "GEMINI_API_KEY is missing from .env.local.",
-        },
-        {
-          status: 500,
-        },
+        { error: "GEMINI_API_KEY is missing from .env.local." },
+        { status: 500 },
       );
     }
 
-    const body =
-      (await request.json()) as GeminiRequestBody;
+    const body = (await request.json()) as GeminiRequestBody;
 
     const prompt =
       typeof body.prompt === "string"
@@ -33,85 +771,179 @@ export async function POST(request: Request) {
 
     if (!prompt) {
       return NextResponse.json(
-        {
-          error: "Please enter a prompt.",
-        },
-        {
-          status: 400,
-        },
+        { error: "Please enter a prompt." },
+        { status: 400 },
       );
     }
 
-    if (prompt.length > 3000) {
+    if (prompt.length > MAX_PROMPT_LENGTH) {
       return NextResponse.json(
         {
-          error:
-            "The prompt must be 3000 characters or fewer.",
+          error: `The prompt must be ${MAX_PROMPT_LENGTH} characters or fewer.`,
         },
-        {
-          status: 400,
-        },
+        { status: 400 },
       );
     }
 
-    const ai = new GoogleGenAI({
-      apiKey,
-    });
+    const boardImage =
+      typeof body.boardImage === "string"
+        ? body.boardImage
+        : "";
 
-    const response =
-      await ai.models.generateContent({
-        model:
-          process.env.GEMINI_MODEL ??
-          "gemini-2.5-flash",
+    const boardImagePart = boardImage
+      ? readBoardImage(boardImage)
+      : null;
 
-        contents: `
-You are Lixia, a concise and friendly teaching assistant
-inside an interactive 3D whiteboard application.
+    const currentCommand = serializeCurrentCommand(
+      body.currentCommand,
+    );
 
-Answer the user's request in a format suitable for writing
-on a whiteboard.
+    const routerInstructions = `
+You are the fast tool router for Lixia, an interactive teaching whiteboard.
 
-Rules:
-- Give a short title.
-- Use short sentences or bullet points.
-- Keep the full answer under 120 words.
-- Do not use markdown tables.
-- Do not include unnecessary introductions.
-- Make difficult concepts easy to understand.
+You MUST call exactly one available function.
+Do not answer with normal prose.
+
+ROUTING RULES:
+- write_text: definitions, explanations, theory, short lessons, factual questions.
+- draw_flowchart: flowcharts, workflows, processes, decision trees, sequences with arrows.
+- plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
+- generate_image: create a NEW realistic/illustrated visual such as a cat, dog, car, person, object, landscape, photo, or scene.
+- edit_board_image: modify a visual already visible on the board, for example "add a dog beside that cat", "remove the tree", or "make the cat bigger".
+
+BOARD CONTEXT:
+- The current structured board content is included below.
+- A current board screenshot may also be attached for follow-up context.
+- If the user says "it", "that", "this chart", "add", "change", "remove", "make it a bar chart", etc., use the existing board context and return the COMPLETE updated content through the appropriate tool.
+- If the user asks a clearly unrelated new question, replace the old topic with the new content.
+- Keep whiteboard content concise and readable.
+- For flowcharts, use row 0-5 and column 0-3 and avoid overlapping grid positions.
+- For weather requests such as "KTM", normalize the location to a geocodable place name such as "Kathmandu, Nepal" when you are confident.
+- "last 10 days till today" means days=10.
+- For realistic pictures and object/animal/person drawings, NEVER fake them with text, SVG, or a flowchart. Use generate_image or edit_board_image.
+- Use edit_board_image only when the request refers to visual content already on the current board.
+
+Current structured board content:
+${currentCommand}
 
 User request:
 ${prompt}
-        `.trim(),
-      });
+    `.trim();
 
-    const text = response.text?.trim();
+    const parts: Part[] = [];
 
-    if (!text) {
+    if (boardImagePart) {
+      parts.push(boardImagePart);
+    }
+
+    parts.push({ text: routerInstructions });
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    const response = await ai.models.generateContent({
+      model:
+        process.env.GEMINI_MODEL ??
+        "gemini-2.5-flash",
+      contents: [
+        {
+          role: "user",
+          parts,
+        },
+      ],
+      config: {
+        temperature: 0.1,
+        tools: [
+          {
+            functionDeclarations: [
+              writeTextDeclaration,
+              drawFlowchartDeclaration,
+              plotWeatherHistoryDeclaration,
+              generateImageDeclaration,
+              editBoardImageDeclaration,
+            ],
+          },
+        ],
+        toolConfig: {
+          functionCallingConfig: {
+            mode: FunctionCallingConfigMode.ANY,
+          },
+        },
+      },
+    });
+
+    const functionCall = response.functionCalls?.[0];
+
+    if (!functionCall) {
+      const fallbackText = response.text?.trim();
+
+      if (fallbackText) {
+        const command: BoardTextCommand = {
+          type: "write_text",
+          title: "Lixia",
+          bullets: [fallbackText.slice(0, 600)],
+        };
+
+        return NextResponse.json({
+          tool: "write_text",
+          command,
+        });
+      }
+
       return NextResponse.json(
-        {
-          error:
-            "Gemini returned an empty response.",
-        },
-        {
-          status: 502,
-        },
+        { error: "Gemini did not choose a whiteboard tool." },
+        { status: 502 },
+      );
+    }
+
+    const args =
+      functionCall.args && typeof functionCall.args === "object"
+        ? (functionCall.args as Record<string, unknown>)
+        : {};
+
+    let command: BoardCommand;
+
+    if (functionCall.name === "write_text") {
+      command = buildTextCommand(args);
+    } else if (functionCall.name === "draw_flowchart") {
+      command = buildFlowchartCommand(args);
+    } else if (functionCall.name === "plot_weather_history") {
+      command = await buildWeatherChart(args);
+    } else if (functionCall.name === "generate_image") {
+      command = await buildImageCommand(
+        ai,
+        args,
+        "create",
+        null,
+      );
+    } else if (functionCall.name === "edit_board_image") {
+      command = await buildImageCommand(
+        ai,
+        args,
+        "edit",
+        boardImagePart,
+      );
+    } else {
+      return NextResponse.json(
+        { error: `Unsupported Gemini tool: ${functionCall.name}` },
+        { status: 502 },
       );
     }
 
     return NextResponse.json({
-      text,
+      tool: functionCall.name,
+      command,
     });
   } catch (error) {
-    console.error("Gemini API error:", error);
+    console.error("Gemini tool router error:", error);
+
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Lixia could not complete that whiteboard request.";
 
     return NextResponse.json(
-      {
-        error:
-          "Gemini could not generate a response.",
-      },
-      {
-        status: 500,
-      },
+      { error: message },
+      { status: 500 },
     );
   }
 }

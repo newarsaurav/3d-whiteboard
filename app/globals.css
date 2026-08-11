@@ -294,6 +294,11 @@ input {
       #9333ea);
 }
 
+.header-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .studio-scene {
   position: relative;
 
@@ -536,6 +541,63 @@ input {
 .board-list::-webkit-scrollbar-thumb {
   border-radius: 999px;
   background: rgba(139, 92, 246, 0.7);
+}
+
+.board-card-shell {
+  position: relative;
+  flex: 0 0 138px;
+  width: 138px;
+  height: 112px;
+}
+
+.board-card-shell .board-card {
+  width: 100%;
+  height: 100%;
+  padding-bottom: 7px;
+}
+
+.board-card-delete {
+  position: absolute;
+  right: 7px;
+  bottom: 7px;
+  z-index: 2;
+
+  width: 24px;
+  height: 24px;
+  padding: 0;
+
+  display: grid;
+  place-items: center;
+
+  border: 1px solid rgba(248, 113, 113, 0.65);
+  border-radius: 7px;
+
+  background: rgba(69, 10, 10, 0.9);
+  color: #ffffff;
+
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+
+  transition:
+    transform 0.15s ease,
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.board-card-delete:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: rgba(248, 113, 113, 1);
+  background: #991b1b;
+}
+
+.board-card-delete:disabled {
+  opacity: 0.32;
+  cursor: not-allowed;
+}
+
+.board-card-shell .board-card-footer {
+  padding-right: 28px;
 }
 
 .board-card,

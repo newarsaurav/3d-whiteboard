@@ -25,7 +25,10 @@ import type { DrawingTool } from "./PresentationBoard";
 
 import StudioEnvironment from "./StudioEnvironment";
 
-import type { Board } from "@/types/board";
+import type {
+  Board,
+  BoardCommand,
+} from "@/types/board";
 
 const BOARD_X = 1.4;
 const BOARD_Z = -0.7;
@@ -53,7 +56,7 @@ const DEFAULT_CAMERA_TARGET: [
 function InitialCameraSetup() {
   const { camera } = useThree();
 
-  useMemo(() => {
+  useEffect(() => {
     camera.position.set(
       ...DEFAULT_CAMERA_POSITION,
     );
@@ -68,19 +71,77 @@ function InitialCameraSetup() {
   return null;
 }
 
+function getLocalBoardCommand(
+  prompt: string,
+): "clear" | "new" | null {
+  const normalized = prompt
+    .toLowerCase()
+    .replace(/[.!?]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (
+    normalized === "clear board" ||
+    normalized === "clear the board" ||
+    normalized === "erase board" ||
+    normalized === "erase the board"
+  ) {
+    return "clear";
+  }
+
+  if (
+    normalized === "new board" ||
+    normalized === "add board" ||
+    normalized === "create new board"
+  ) {
+    return "new";
+  }
+
+  return null;
+}
+
+function looksLikeBoardFollowUp(
+  prompt: string,
+): boolean {
+  const normalized = prompt.toLowerCase();
+
+  const markers = [
+    "add ",
+    "change ",
+    "update ",
+    "remove ",
+    "delete ",
+    "move ",
+    "replace ",
+    "make it",
+    "make this",
+    "make that",
+    "this ",
+    "that ",
+    " it ",
+    "same ",
+    "above",
+    "below",
+    "beside",
+    "next to",
+    "on the side",
+    "the chart",
+    "the graph",
+    "the flowchart",
+    "the diagram",
+    "the board",
+  ];
+
+  return markers.some((marker) =>
+    normalized.includes(marker),
+  );
+}
+
 export default function LixiaStudio() {
 
 
-
-  const [boardText, setBoardText] = useState("");
-
   const [assistantPrompt, setAssistantPrompt] =
     useState("");
-
-  const [assistantResponse, setAssistantResponse] =
-    useState(
-      "Hello! What would you like me to explain on the board?",
-    );
 
   const [isGenerating, setIsGenerating] =
     useState(false);
@@ -117,8 +178,8 @@ export default function LixiaStudio() {
       id: 1,
       name: "WhiteBoard Detail name ",
       drawing: null,
-      generatedText: "",
-      generatedTextVersion: 0,
+      generatedCommand: null,
+      generatedCommandVersion: 0,
     },
   ]);
 
@@ -169,6 +230,19 @@ export default function LixiaStudio() {
   }
 
   function clearBoard() {
+    // Clear the AI SVG context too, so a future prompt reads
+    // the blank/current board instead of an old generated scene.
+    setBoards((currentBoards) =>
+      currentBoards.map((board) =>
+        board.id === activeBoardId
+          ? {
+              ...board,
+              generatedCommand: null,
+            }
+          : board,
+      ),
+    );
+
     setClearSignal(
       (currentSignal) =>
         currentSignal + 1,
@@ -191,8 +265,8 @@ export default function LixiaStudio() {
       id: nextId,
       name: `Board ${nextId}`,
       drawing: null,
-      generatedText: "",
-      generatedTextVersion: 0,
+      generatedCommand: null,
+      generatedCommandVersion: 0,
     };
 
     setBoards((currentBoards) => [
@@ -203,10 +277,43 @@ export default function LixiaStudio() {
     setActiveBoardId(nextId);
   }
 
-  if (!activeBoard) {
-    return null;
-  }
+  function deleteBoard(boardId: number) {
+    if (boards.length <= 1) {
+      return;
+    }
 
+    const boardIndex = boards.findIndex(
+      (board) => board.id === boardId,
+    );
+
+    if (boardIndex === -1) {
+      return;
+    }
+
+    const boardToDelete = boards[boardIndex];
+
+    const shouldDelete = window.confirm(
+      `Delete ${boardToDelete.name}? This cannot be undone.`,
+    );
+
+    if (!shouldDelete) {
+      return;
+    }
+
+    const nextActiveBoard =
+      boards[boardIndex + 1] ??
+      boards[boardIndex - 1];
+
+    setBoards((currentBoards) =>
+      currentBoards.filter(
+        (board) => board.id !== boardId,
+      ),
+    );
+
+    if (boardId === activeBoardId && nextActiveBoard) {
+      setActiveBoardId(nextActiveBoard.id);
+    }
+  }
 
   const updateBoardDrawing = useCallback(
     (
@@ -227,6 +334,10 @@ export default function LixiaStudio() {
     [],
   );
 
+  if (!activeBoard) {
+    return null;
+  }
+
   async function askGemini() {
     const prompt = assistantPrompt.trim();
 
@@ -235,10 +346,43 @@ export default function LixiaStudio() {
     }
 
     /*
-     * Remember which board started the request.
-     * This value will not change if the user switches boards.
+     * Very obvious board commands do not need Gemini at all.
+     * This makes them instant and saves an API request.
      */
+    const localCommand = getLocalBoardCommand(prompt);
+
+    if (localCommand === "clear") {
+      clearBoard();
+      setAssistantPrompt("");
+      setAssistantError(null);
+      return;
+    }
+
+    if (localCommand === "new") {
+      addBoard();
+      setAssistantPrompt("");
+      setAssistantError(null);
+      return;
+    }
+
+    // Remember the exact board that started this request.
     const targetBoardId = activeBoardId;
+    const targetBoard = boards.find(
+      (board) => board.id === targetBoardId,
+    );
+
+    if (!targetBoard) {
+      return;
+    }
+
+    /*
+     * Sending a 1600x900 PNG on every request adds latency.
+     * New standalone questions such as "what is silver?" do not
+     * need it. Follow-up/edit language does, so only attach the
+     * board screenshot when it is likely useful.
+     */
+    const sendBoardImage =
+      looksLikeBoardFollowUp(prompt);
 
     setIsGenerating(true);
     setAssistantError(null);
@@ -246,60 +390,47 @@ export default function LixiaStudio() {
     try {
       const response = await fetch("/api/gemini", {
         method: "POST",
-
         headers: {
           "Content-Type": "application/json",
         },
-
         body: JSON.stringify({
           prompt,
+          currentCommand:
+            targetBoard.generatedCommand,
+          boardImage: sendBoardImage
+            ? targetBoard.drawing
+            : null,
         }),
       });
 
       const data = (await response.json()) as {
-        text?: string;
+        tool?: string;
+        command?: BoardCommand;
         error?: string;
       };
 
       if (!response.ok) {
         throw new Error(
-          data.error ??
-          "Gemini request failed.",
+          data.error ?? "Gemini request failed.",
         );
       }
 
-      if (!data.text) {
+      if (!data.command) {
         throw new Error(
-          "Gemini returned no text.",
+          "Gemini returned no whiteboard command.",
         );
       }
 
-      setAssistantResponse(data.text);
-
-      /*
-       * Store the response only on the board
-       * that was active when the request began.
-       */
+      // Store the result only on the board that started the request.
       setBoards((currentBoards) =>
         currentBoards.map((board) =>
           board.id === targetBoardId
             ? {
-              ...board,
-
-              /*
-               * Clear the previous board image so the
-               * new AI response starts on a clean board.
-               *
-               * Remove this line if you want AI content
-               * added below existing content instead.
-               */
-              drawing: null,
-
-              generatedText: data.text ?? "",
-
-              generatedTextVersion:
-                board.generatedTextVersion + 1,
-            }
+                ...board,
+                generatedCommand: data.command ?? null,
+                generatedCommandVersion:
+                  board.generatedCommandVersion + 1,
+              }
             : board,
         ),
       );
@@ -316,6 +447,7 @@ export default function LixiaStudio() {
       setIsGenerating(false);
     }
   }
+
   return (
     <main className="studio">
       <header className="studio-header">
@@ -468,19 +600,11 @@ export default function LixiaStudio() {
             </div>
           </div>
 
-          <div className="assistant-message">
-            <p className="assistant-response-text">
-              {isGenerating
-                ? "Lixia is thinking..."
-                : assistantResponse}
+          {assistantError && (
+            <p className="assistant-error">
+              {assistantError}
             </p>
-
-            {assistantError && (
-              <p className="assistant-error">
-                {assistantError}
-              </p>
-            )}
-          </div>
+          )}
 
           <form
             className="assistant-input-area"
@@ -575,11 +699,11 @@ export default function LixiaStudio() {
             clearSignal={clearSignal}
             boardId={activeBoard.id}
             savedDrawing={activeBoard.drawing}
-            generatedText={
-              activeBoard.generatedText
+            generatedCommand={
+              activeBoard.generatedCommand
             }
-            generatedTextVersion={
-              activeBoard.generatedTextVersion
+            generatedCommandVersion={
+              activeBoard.generatedCommandVersion
             }
             onDrawingChange={updateBoardDrawing}
           />
@@ -616,40 +740,59 @@ export default function LixiaStudio() {
 
           <div className="board-list">
             {boards.map((board) => (
-              <button
+              <div
                 key={board.id}
-                type="button"
-                className={
-                  board.id ===
-                    activeBoardId
-                    ? "board-card active"
-                    : "board-card"
-                }
-                onClick={() =>
-                  selectBoard(board.id)
-                }
+                className="board-card-shell"
               >
-                <div className="board-preview">
-                  {board.drawing ? (
-                    <img
-                      src={board.drawing}
-                      alt={board.name}
-                      className="board-preview-image"
-                    />
-                  ) : (
-                    <div className="board-preview-placeholder">
-                      <span className="placeholder-icon">📝</span>
-                      <span>Empty Board</span>
-                    </div>
-                  )}
-                </div>
-                <div className="board-card-footer">
-                  <span>{board.id}</span>
-                  <strong>
-                    {board.name}
-                  </strong>
-                </div>
-              </button>
+                <button
+                  type="button"
+                  className={
+                    board.id ===
+                      activeBoardId
+                      ? "board-card active"
+                      : "board-card"
+                  }
+                  onClick={() =>
+                    selectBoard(board.id)
+                  }
+                >
+                  <div className="board-preview">
+                    {board.drawing ? (
+                      <img
+                        src={board.drawing}
+                        alt={board.name}
+                        className="board-preview-image"
+                      />
+                    ) : (
+                      <div className="board-preview-placeholder">
+                        <span className="placeholder-icon">📝</span>
+                        <span>Empty Board</span>
+                      </div>
+                    )}
+                  </div>
+                  <div className="board-card-footer">
+                    <span>{board.id}</span>
+                    <strong>
+                      {board.name}
+                    </strong>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  className="board-card-delete"
+                  onClick={() => deleteBoard(board.id)}
+                  disabled={boards.length <= 1}
+                  title={
+                    boards.length > 1
+                      ? `Delete ${board.name}`
+                      : "At least one board must remain"
+                  }
+                  aria-label={`Delete ${board.name}`}
+                >
+                  🗑
+                </button>
+              </div>
             ))}
 
             <button

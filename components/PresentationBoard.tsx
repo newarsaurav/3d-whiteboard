@@ -10,6 +10,14 @@ import {
 import type { ThreeEvent } from "@react-three/fiber";
 import * as THREE from "three";
 
+import type {
+  BoardChartCommand,
+  BoardCommand,
+  BoardFlowchartCommand,
+  BoardImageCommand,
+  BoardTextCommand,
+} from "@/types/board";
+
 export type DrawingTool = "pen" | "eraser";
 
 interface PresentationBoardProps {
@@ -25,13 +33,14 @@ interface PresentationBoardProps {
   boardId: number;
   savedDrawing: string | null;
 
-  generatedText: string;
-  generatedTextVersion: number;
+  generatedCommand: BoardCommand | null;
+  generatedCommandVersion: number;
 
   onDrawingChange: (
     boardId: number,
     drawing: string,
   ) => void;
+
 }
 
 type Point = {
@@ -39,15 +48,7 @@ type Point = {
   y: number;
 };
 
-type CharacterInstruction = {
-  character: string;
-  x: number;
-  y: number;
-  font: string;
-  color: string;
-  rotation: number;
-  delay: number;
-};
+
 
 const FRAME_WIDTH = 7.4;
 const FRAME_DEPTH = 0.18;
@@ -216,6 +217,942 @@ function interpolatePoint(
   ];
 }
 
+
+type RenderPoint = {
+  x: number;
+  y: number;
+};
+
+type RenderNode = {
+  id: string;
+  label: string;
+  row: number;
+  column: number;
+  shape: "rounded" | "diamond" | "circle";
+  center: RenderPoint;
+  width: number;
+  height: number;
+};
+
+const BOARD_BACKGROUND = "#fffef9";
+const BOARD_INK = "#172033";
+const BOARD_MUTED = "#5b6474";
+const CHART_COLORS = [
+  "#2563eb",
+  "#dc2626",
+  "#059669",
+  "#7c3aed",
+];
+
+function clampNumber(
+  value: number,
+  min: number,
+  max: number,
+): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function getWrappedLines(
+  context: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+): string[] {
+  const words = text
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+
+  if (words.length === 0) {
+    return [];
+  }
+
+  const lines: string[] = [];
+  let currentLine = words[0];
+
+  for (let index = 1; index < words.length; index += 1) {
+    const candidate = `${currentLine} ${words[index]}`;
+
+    if (context.measureText(candidate).width <= maxWidth) {
+      currentLine = candidate;
+    } else {
+      lines.push(currentLine);
+      currentLine = words[index];
+    }
+  }
+
+  lines.push(currentLine);
+  return lines;
+}
+
+function drawCenteredWrappedText(
+  context: CanvasRenderingContext2D,
+  text: string,
+  centerX: number,
+  centerY: number,
+  maxWidth: number,
+  lineHeight: number,
+  maxLines = 3,
+) {
+  const lines = getWrappedLines(
+    context,
+    text,
+    maxWidth,
+  ).slice(0, maxLines);
+
+  const totalHeight =
+    Math.max(0, lines.length - 1) * lineHeight;
+
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+
+  lines.forEach((line, index) => {
+    context.fillText(
+      line,
+      centerX,
+      centerY - totalHeight / 2 + index * lineHeight,
+    );
+  });
+}
+
+function renderTextCommand(
+  context: CanvasRenderingContext2D,
+  command: BoardTextCommand,
+) {
+  const marginX = 95;
+
+  context.fillStyle = "#312e81";
+  context.font =
+    '600 64px "Lixia Handwriting", "Comic Sans MS", cursive';
+  context.textAlign = "left";
+  context.textBaseline = "top";
+
+  const titleLines = getWrappedLines(
+    context,
+    command.title,
+    CANVAS_WIDTH - marginX * 2,
+  ).slice(0, 2);
+
+  titleLines.forEach((line, index) => {
+    context.fillText(
+      line,
+      marginX,
+      62 + index * 72,
+    );
+  });
+
+  let currentY =
+    62 + Math.max(1, titleLines.length) * 78 + 24;
+
+  context.fillStyle = BOARD_INK;
+  context.font =
+    '400 42px "Lixia Handwriting", "Comic Sans MS", cursive';
+
+  for (const bullet of command.bullets.slice(0, 8)) {
+    const lines = getWrappedLines(
+      context,
+      bullet,
+      CANVAS_WIDTH - 250,
+    );
+
+    if (currentY + lines.length * 54 > 760) {
+      break;
+    }
+
+    context.beginPath();
+    context.arc(
+      marginX + 12,
+      currentY + 24,
+      6,
+      0,
+      Math.PI * 2,
+    );
+    context.fill();
+
+    lines.forEach((line, index) => {
+      context.fillText(
+        line,
+        marginX + 42,
+        currentY + index * 54,
+      );
+    });
+
+    currentY += Math.max(1, lines.length) * 54 + 18;
+  }
+
+  if (command.note && currentY < 785) {
+    context.save();
+    context.fillStyle = "#eef2ff";
+    context.strokeStyle = "#818cf8";
+    context.lineWidth = 3;
+
+    context.beginPath();
+    context.roundRect(
+      marginX,
+      Math.min(currentY + 6, 760),
+      CANVAS_WIDTH - marginX * 2,
+      92,
+      18,
+    );
+    context.fill();
+    context.stroke();
+
+    context.fillStyle = "#3730a3";
+    context.font =
+      '600 32px "Lixia Handwriting", "Comic Sans MS", cursive';
+    context.textBaseline = "middle";
+
+    const noteLines = getWrappedLines(
+      context,
+      command.note,
+      CANVAS_WIDTH - marginX * 2 - 56,
+    ).slice(0, 2);
+
+    noteLines.forEach((line, index) => {
+      context.fillText(
+        line,
+        marginX + 28,
+        Math.min(currentY + 52, 806) +
+          (index - (noteLines.length - 1) / 2) * 34,
+      );
+    });
+
+    context.restore();
+  }
+}
+
+function nodeBoundaryPoint(
+  from: RenderNode,
+  toward: RenderNode,
+): RenderPoint {
+  const dx = toward.center.x - from.center.x;
+  const dy = toward.center.y - from.center.y;
+
+  if (dx === 0 && dy === 0) {
+    return { ...from.center };
+  }
+
+  const halfWidth = from.width / 2;
+  const halfHeight = from.height / 2;
+
+  const scale = 1 / Math.max(
+    Math.abs(dx) / Math.max(halfWidth, 1),
+    Math.abs(dy) / Math.max(halfHeight, 1),
+  );
+
+  return {
+    x: from.center.x + dx * scale,
+    y: from.center.y + dy * scale,
+  };
+}
+
+function drawArrow(
+  context: CanvasRenderingContext2D,
+  start: RenderPoint,
+  end: RenderPoint,
+  label?: string,
+) {
+  const angle = Math.atan2(
+    end.y - start.y,
+    end.x - start.x,
+  );
+
+  context.save();
+  context.strokeStyle = "#475569";
+  context.fillStyle = "#475569";
+  context.lineWidth = 4;
+  context.lineCap = "round";
+
+  context.beginPath();
+  context.moveTo(start.x, start.y);
+  context.lineTo(end.x, end.y);
+  context.stroke();
+
+  const arrowSize = 18;
+
+  context.beginPath();
+  context.moveTo(end.x, end.y);
+  context.lineTo(
+    end.x - arrowSize * Math.cos(angle - Math.PI / 6),
+    end.y - arrowSize * Math.sin(angle - Math.PI / 6),
+  );
+  context.lineTo(
+    end.x - arrowSize * Math.cos(angle + Math.PI / 6),
+    end.y - arrowSize * Math.sin(angle + Math.PI / 6),
+  );
+  context.closePath();
+  context.fill();
+
+  if (label) {
+    const middleX = (start.x + end.x) / 2;
+    const middleY = (start.y + end.y) / 2;
+
+    context.font = '600 25px "Segoe UI", sans-serif';
+    const width = context.measureText(label).width + 22;
+
+    context.fillStyle = BOARD_BACKGROUND;
+    context.fillRect(
+      middleX - width / 2,
+      middleY - 18,
+      width,
+      36,
+    );
+
+    context.fillStyle = "#334155";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillText(label, middleX, middleY);
+  }
+
+  context.restore();
+}
+
+function drawFlowchartNode(
+  context: CanvasRenderingContext2D,
+  node: RenderNode,
+) {
+  const left = node.center.x - node.width / 2;
+  const top = node.center.y - node.height / 2;
+
+  context.save();
+  context.fillStyle = "#ffffff";
+  context.strokeStyle = "#334155";
+  context.lineWidth = 4;
+
+  if (node.shape === "diamond") {
+    context.beginPath();
+    context.moveTo(node.center.x, top);
+    context.lineTo(left + node.width, node.center.y);
+    context.lineTo(node.center.x, top + node.height);
+    context.lineTo(left, node.center.y);
+    context.closePath();
+    context.fill();
+    context.stroke();
+  } else if (node.shape === "circle") {
+    context.beginPath();
+    context.ellipse(
+      node.center.x,
+      node.center.y,
+      node.width / 2,
+      node.height / 2,
+      0,
+      0,
+      Math.PI * 2,
+    );
+    context.fill();
+    context.stroke();
+  } else {
+    context.beginPath();
+    context.roundRect(
+      left,
+      top,
+      node.width,
+      node.height,
+      22,
+    );
+    context.fill();
+    context.stroke();
+  }
+
+  context.fillStyle = BOARD_INK;
+  context.font = '600 29px "Segoe UI", sans-serif';
+
+  drawCenteredWrappedText(
+    context,
+    node.label,
+    node.center.x,
+    node.center.y,
+    node.width - 34,
+    34,
+    node.shape === "diamond" ? 2 : 3,
+  );
+
+  context.restore();
+}
+
+function renderFlowchartCommand(
+  context: CanvasRenderingContext2D,
+  command: BoardFlowchartCommand,
+) {
+  context.fillStyle = "#312e81";
+  context.font =
+    '600 58px "Lixia Handwriting", "Comic Sans MS", cursive';
+  context.textAlign = "left";
+  context.textBaseline = "top";
+  context.fillText(command.title, 90, 52);
+
+  if (command.nodes.length === 0) {
+    context.fillStyle = BOARD_INK;
+    context.font = '38px "Segoe UI", sans-serif';
+    context.fillText("No flowchart nodes were returned.", 90, 180);
+    return;
+  }
+
+  const minRow = Math.min(
+    ...command.nodes.map((node) => node.row),
+  );
+  const maxRow = Math.max(
+    ...command.nodes.map((node) => node.row),
+  );
+  const minColumn = Math.min(
+    ...command.nodes.map((node) => node.column),
+  );
+  const maxColumn = Math.max(
+    ...command.nodes.map((node) => node.column),
+  );
+
+  const rowCount = Math.max(1, maxRow - minRow + 1);
+  const columnCount = Math.max(
+    1,
+    maxColumn - minColumn + 1,
+  );
+
+  const areaLeft = 80;
+  const areaTop = 150;
+  const areaWidth = CANVAS_WIDTH - 160;
+  const areaHeight = 650;
+
+  const cellWidth = areaWidth / columnCount;
+  const cellHeight = areaHeight / rowCount;
+
+  const nodeWidth = clampNumber(
+    cellWidth * 0.7,
+    180,
+    300,
+  );
+  const nodeHeight = clampNumber(
+    cellHeight * 0.56,
+    82,
+    126,
+  );
+
+  const renderNodes: RenderNode[] = command.nodes.map((node) => ({
+    ...node,
+    center: {
+      x:
+        areaLeft +
+        cellWidth * (node.column - minColumn + 0.5),
+      y:
+        areaTop +
+        cellHeight * (node.row - minRow + 0.5),
+    },
+    width:
+      node.shape === "circle"
+        ? Math.min(nodeWidth, 190)
+        : nodeWidth,
+    height:
+      node.shape === "circle"
+        ? Math.min(nodeHeight, 110)
+        : nodeHeight,
+  }));
+
+  const nodeMap = new Map(
+    renderNodes.map((node) => [node.id, node]),
+  );
+
+  for (const edge of command.edges) {
+    const from = nodeMap.get(edge.from);
+    const to = nodeMap.get(edge.to);
+
+    if (!from || !to) {
+      continue;
+    }
+
+    drawArrow(
+      context,
+      nodeBoundaryPoint(from, to),
+      nodeBoundaryPoint(to, from),
+      edge.label,
+    );
+  }
+
+  renderNodes.forEach((node) => {
+    drawFlowchartNode(context, node);
+  });
+}
+
+function formatChartValue(value: number): string {
+  const absolute = Math.abs(value);
+
+  if (absolute >= 1000) {
+    return new Intl.NumberFormat("en", {
+      notation: "compact",
+      maximumFractionDigits: 1,
+    }).format(value);
+  }
+
+  if (absolute >= 100) {
+    return value.toFixed(0);
+  }
+
+  return value.toFixed(1).replace(/\.0$/, "");
+}
+
+function renderCartesianChart(
+  context: CanvasRenderingContext2D,
+  command: BoardChartCommand,
+) {
+  const chartLeft = 135;
+  const chartTop = 210;
+  const chartWidth = 1325;
+  const chartHeight = 500;
+
+  const values: number[] = [];
+
+  for (const row of command.data) {
+    for (const series of command.series) {
+      const value = row[series.key];
+
+      if (typeof value === "number" && Number.isFinite(value)) {
+        values.push(value);
+      }
+    }
+  }
+
+  if (values.length === 0) {
+    context.fillStyle = BOARD_INK;
+    context.font = '36px "Segoe UI", sans-serif';
+    context.fillText("No numeric chart data was returned.", 100, 220);
+    return;
+  }
+
+  let minimum = Math.min(...values);
+  let maximum = Math.max(...values);
+
+  if (command.chartType === "bar" && minimum >= 0) {
+    minimum = 0;
+  } else {
+    const padding = Math.max((maximum - minimum) * 0.12, 1);
+    minimum -= padding;
+    maximum += padding;
+  }
+
+  if (maximum === minimum) {
+    maximum += 1;
+    minimum -= 1;
+  }
+
+  const yTicks = 5;
+
+  context.save();
+  context.font = '24px "Segoe UI", sans-serif';
+  context.textBaseline = "middle";
+
+  for (let index = 0; index <= yTicks; index += 1) {
+    const ratio = index / yTicks;
+    const y = chartTop + chartHeight - ratio * chartHeight;
+    const value = minimum + ratio * (maximum - minimum);
+
+    context.strokeStyle = "#dbe2ea";
+    context.lineWidth = 2;
+    context.beginPath();
+    context.moveTo(chartLeft, y);
+    context.lineTo(chartLeft + chartWidth, y);
+    context.stroke();
+
+    context.fillStyle = BOARD_MUTED;
+    context.textAlign = "right";
+    context.fillText(
+      formatChartValue(value),
+      chartLeft - 18,
+      y,
+    );
+  }
+
+  context.strokeStyle = "#64748b";
+  context.lineWidth = 3;
+  context.beginPath();
+  context.moveTo(chartLeft, chartTop);
+  context.lineTo(chartLeft, chartTop + chartHeight);
+  context.lineTo(chartLeft + chartWidth, chartTop + chartHeight);
+  context.stroke();
+
+  const dataCount = Math.max(1, command.data.length);
+  const stepX = chartWidth / dataCount;
+  const labelEvery = Math.max(1, Math.ceil(dataCount / 12));
+
+  command.data.forEach((row, index) => {
+    if (index % labelEvery !== 0 && index !== command.data.length - 1) {
+      return;
+    }
+
+    const label = String(row.label ?? row.date ?? index + 1);
+    const x = chartLeft + stepX * (index + 0.5);
+
+    context.fillStyle = BOARD_MUTED;
+    context.font = '22px "Segoe UI", sans-serif';
+    context.textAlign = "center";
+    context.textBaseline = "top";
+    context.fillText(
+      label,
+      x,
+      chartTop + chartHeight + 16,
+    );
+  });
+
+  const valueToY = (value: number) =>
+    chartTop +
+    chartHeight -
+    ((value - minimum) / (maximum - minimum)) * chartHeight;
+
+  if (command.chartType === "bar") {
+    const seriesCount = Math.max(1, command.series.length);
+    const groupWidth = stepX * 0.72;
+    const barWidth = Math.max(5, groupWidth / seriesCount - 5);
+    const zeroY = valueToY(clampNumber(0, minimum, maximum));
+
+    command.data.forEach((row, dataIndex) => {
+      command.series.forEach((series, seriesIndex) => {
+        const value = row[series.key];
+
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+          return;
+        }
+
+        const x =
+          chartLeft +
+          stepX * dataIndex +
+          (stepX - groupWidth) / 2 +
+          seriesIndex * (groupWidth / seriesCount) +
+          2;
+
+        const valueY = valueToY(value);
+        const top = Math.min(zeroY, valueY);
+        const height = Math.max(2, Math.abs(zeroY - valueY));
+
+        context.fillStyle =
+          CHART_COLORS[seriesIndex % CHART_COLORS.length];
+
+        context.beginPath();
+        context.roundRect(
+          x,
+          top,
+          barWidth,
+          height,
+          7,
+        );
+        context.fill();
+      });
+    });
+  } else {
+    command.series.forEach((series, seriesIndex) => {
+      context.strokeStyle =
+        CHART_COLORS[seriesIndex % CHART_COLORS.length];
+      context.fillStyle =
+        CHART_COLORS[seriesIndex % CHART_COLORS.length];
+      context.lineWidth = 5;
+      context.lineJoin = "round";
+      context.lineCap = "round";
+
+      let started = false;
+      context.beginPath();
+
+      command.data.forEach((row, dataIndex) => {
+        const value = row[series.key];
+
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+          return;
+        }
+
+        const x = chartLeft + stepX * (dataIndex + 0.5);
+        const y = valueToY(value);
+
+        if (!started) {
+          context.moveTo(x, y);
+          started = true;
+        } else {
+          context.lineTo(x, y);
+        }
+      });
+
+      context.stroke();
+
+      command.data.forEach((row, dataIndex) => {
+        const value = row[series.key];
+
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+          return;
+        }
+
+        const x = chartLeft + stepX * (dataIndex + 0.5);
+        const y = valueToY(value);
+
+        context.beginPath();
+        context.arc(x, y, 6, 0, Math.PI * 2);
+        context.fill();
+      });
+    });
+  }
+
+  context.font = '600 23px "Segoe UI", sans-serif';
+  context.textAlign = "left";
+  context.textBaseline = "middle";
+
+  let legendX = chartLeft;
+  const legendY = 170;
+
+  command.series.forEach((series, index) => {
+    context.fillStyle = CHART_COLORS[index % CHART_COLORS.length];
+    context.fillRect(legendX, legendY - 7, 28, 14);
+
+    context.fillStyle = BOARD_INK;
+    const label = series.unit
+      ? `${series.label} (${series.unit})`
+      : series.label;
+
+    context.fillText(label, legendX + 38, legendY);
+    legendX += context.measureText(label).width + 85;
+  });
+
+  if (command.yAxisLabel) {
+    context.save();
+    context.translate(34, chartTop + chartHeight / 2);
+    context.rotate(-Math.PI / 2);
+    context.fillStyle = BOARD_MUTED;
+    context.font = '600 23px "Segoe UI", sans-serif';
+    context.textAlign = "center";
+    context.fillText(command.yAxisLabel, 0, 0);
+    context.restore();
+  }
+
+  if (command.xAxisLabel) {
+    context.fillStyle = BOARD_MUTED;
+    context.font = '600 23px "Segoe UI", sans-serif';
+    context.textAlign = "center";
+    context.textBaseline = "top";
+    context.fillText(
+      command.xAxisLabel,
+      chartLeft + chartWidth / 2,
+      780,
+    );
+  }
+
+  context.restore();
+}
+
+function renderPieChart(
+  context: CanvasRenderingContext2D,
+  command: BoardChartCommand,
+) {
+  const series = command.series[0];
+
+  if (!series) {
+    return;
+  }
+
+  const slices = command.data
+    .map((row, index) => {
+      const value = row[series.key];
+
+      return {
+        label: String(row.label ?? row.name ?? `Item ${index + 1}`),
+        value:
+          typeof value === "number" && Number.isFinite(value)
+            ? Math.max(0, value)
+            : 0,
+      };
+    })
+    .filter((slice) => slice.value > 0)
+    .slice(0, 8);
+
+  const total = slices.reduce(
+    (sum, slice) => sum + slice.value,
+    0,
+  );
+
+  if (total <= 0) {
+    context.fillStyle = BOARD_INK;
+    context.font = '36px "Segoe UI", sans-serif';
+    context.fillText("No positive pie-chart data was returned.", 100, 220);
+    return;
+  }
+
+  const centerX = 520;
+  const centerY = 470;
+  const radius = 250;
+  let startAngle = -Math.PI / 2;
+
+  slices.forEach((slice, index) => {
+    const angle = (slice.value / total) * Math.PI * 2;
+
+    context.fillStyle = CHART_COLORS[index % CHART_COLORS.length];
+    context.beginPath();
+    context.moveTo(centerX, centerY);
+    context.arc(
+      centerX,
+      centerY,
+      radius,
+      startAngle,
+      startAngle + angle,
+    );
+    context.closePath();
+    context.fill();
+
+    startAngle += angle;
+  });
+
+  context.font = '600 28px "Segoe UI", sans-serif';
+  context.textAlign = "left";
+  context.textBaseline = "middle";
+
+  slices.forEach((slice, index) => {
+    const y = 280 + index * 62;
+    const percentage = (slice.value / total) * 100;
+
+    context.fillStyle = CHART_COLORS[index % CHART_COLORS.length];
+    context.fillRect(900, y - 12, 30, 24);
+
+    context.fillStyle = BOARD_INK;
+    context.fillText(
+      `${slice.label} — ${percentage.toFixed(1)}%`,
+      948,
+      y,
+    );
+  });
+}
+
+function renderChartCommand(
+  context: CanvasRenderingContext2D,
+  command: BoardChartCommand,
+) {
+  context.fillStyle = "#312e81";
+  context.font = '700 52px "Segoe UI", sans-serif';
+  context.textAlign = "left";
+  context.textBaseline = "top";
+
+  const titleLines = getWrappedLines(
+    context,
+    command.title,
+    1420,
+  ).slice(0, 2);
+
+  titleLines.forEach((line, index) => {
+    context.fillText(line, 90, 45 + index * 58);
+  });
+
+  if (command.subtitle) {
+    context.fillStyle = BOARD_MUTED;
+    context.font = '25px "Segoe UI", sans-serif';
+    context.fillText(
+      command.subtitle,
+      92,
+      112 + Math.max(0, titleLines.length - 1) * 58,
+    );
+  }
+
+  if (command.chartType === "pie") {
+    renderPieChart(context, command);
+  } else {
+    renderCartesianChart(context, command);
+  }
+
+  const footerParts: string[] = [];
+
+  if (command.source) {
+    footerParts.push(`Source: ${command.source}`);
+  }
+
+  if (command.fetchedAt) {
+    const date = new Date(command.fetchedAt);
+
+    if (!Number.isNaN(date.getTime())) {
+      footerParts.push(
+        `Fetched: ${date.toLocaleString([], {
+          dateStyle: "medium",
+          timeStyle: "short",
+        })}`,
+      );
+    }
+  }
+
+  if (footerParts.length > 0) {
+    context.fillStyle = "#64748b";
+    context.font = '22px "Segoe UI", sans-serif';
+    context.textAlign = "left";
+    context.textBaseline = "bottom";
+    context.fillText(
+      footerParts.join(" • "),
+      90,
+      865,
+    );
+  }
+}
+
+function renderBoardCommandToCanvas(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  command: BoardCommand,
+) {
+  context.save();
+  context.globalCompositeOperation = "source-over";
+  context.fillStyle = BOARD_BACKGROUND;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.restore();
+
+  context.save();
+
+  if (command.type === "write_text") {
+    renderTextCommand(context, command);
+  } else if (command.type === "flowchart") {
+    renderFlowchartCommand(context, command);
+  } else if (command.type === "chart") {
+    renderChartCommand(context, command);
+  }
+
+  context.restore();
+}
+
+function loadBoardImage(
+  command: BoardImageCommand,
+): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+
+    image.onload = () => resolve(image);
+    image.onerror = () =>
+      reject(
+        new Error(
+          "Could not load the generated image for the whiteboard.",
+        ),
+      );
+
+    image.src = command.imageDataUrl;
+  });
+}
+
+function paintBoardImage(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  image: HTMLImageElement,
+) {
+  context.save();
+  context.globalCompositeOperation = "source-over";
+  context.fillStyle = BOARD_BACKGROUND;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Gemini is requested to return 16:9 images, matching the board.
+  // Use contain as a safety net so no part of the generated image is
+  // cropped if a model returns a slightly different aspect ratio.
+  const scale = Math.min(
+    canvas.width / image.naturalWidth,
+    canvas.height / image.naturalHeight,
+  );
+
+  const width = image.naturalWidth * scale;
+  const height = image.naturalHeight * scale;
+  const x = (canvas.width - width) / 2;
+  const y = (canvas.height - height) / 2;
+
+  context.drawImage(
+    image,
+    x,
+    y,
+    width,
+    height,
+  );
+  context.restore();
+}
+
 export default function PresentationBoard({
   position,
   frameHeight,
@@ -226,8 +1163,8 @@ export default function PresentationBoard({
   clearSignal,
   boardId,
   savedDrawing,
-  generatedText,
-  generatedTextVersion,
+  generatedCommand,
+  generatedCommandVersion,
   onDrawingChange,
 }: PresentationBoardProps) {
   const isDrawingRef = useRef(false);
@@ -244,24 +1181,11 @@ export default function PresentationBoard({
   const activeBoardIdRef =
     useRef(boardId);
 
-  const handwritingTimerRef =
-    useRef<number | null>(null);
-
-  const handwritingRunRef =
-    useRef(0);
-
-  /*
-   * Stores the last Gemini response version that
-   * has already been written for each board.
-   *
-   * Example:
-   * {
-   *   1: 4,
-   *   2: 7
-   * }
-   */
-  const completedHandwritingRef =
+  const completedCommandRenderRef =
     useRef<Record<number, number>>({});
+
+  const drawingLoadRunRef = useRef(0);
+  const commandRenderRunRef = useRef(0);
 
   const drawingCanvas = useMemo(() => {
     if (typeof document === "undefined") {
@@ -374,6 +1298,68 @@ export default function PresentationBoard({
       onDrawingChange,
     ]);
 
+  const renderCommandToBoard = useCallback(
+    async (
+      command: BoardCommand,
+      targetBoardId: number,
+      renderRun: number,
+    ) => {
+      if (!drawingCanvas || !context) {
+        return;
+      }
+
+      // Do not paint a result onto a different board if the user
+      // switched boards while Gemini was answering.
+      if (
+        renderRun !== commandRenderRunRef.current ||
+        activeBoardIdRef.current !== targetBoardId
+      ) {
+        return;
+      }
+
+      if (command.type === "image") {
+        const image = await loadBoardImage(command);
+
+        // Image decoding is asynchronous. Check again after it finishes
+        // so an old result cannot paint onto a newly selected board.
+        if (
+          renderRun !== commandRenderRunRef.current ||
+          activeBoardIdRef.current !== targetBoardId
+        ) {
+          return;
+        }
+
+        paintBoardImage(
+          context,
+          drawingCanvas,
+          image,
+        );
+      } else {
+        renderBoardCommandToCanvas(
+          context,
+          drawingCanvas,
+          command,
+        );
+      }
+
+      refreshTexture();
+
+      const finishedDrawing =
+        drawingCanvas.toDataURL("image/png");
+
+      onDrawingChange(
+        targetBoardId,
+        finishedDrawing,
+      );
+    },
+    [
+      drawingCanvas,
+      context,
+      refreshTexture,
+      onDrawingChange,
+    ],
+  );
+
   /*
    * Initialize the white canvas.
    */
@@ -381,14 +1367,6 @@ export default function PresentationBoard({
     fillBoardWhite();
 
     return () => {
-      if (
-        handwritingTimerRef.current !== null
-      ) {
-        window.clearTimeout(
-          handwritingTimerRef.current,
-        );
-      }
-
       texture?.dispose();
 
       document.body.style.cursor =
@@ -405,46 +1383,40 @@ export default function PresentationBoard({
   useEffect(() => {
     activeBoardIdRef.current = boardId;
 
-    if (
-      !drawingCanvas ||
-      !context
-    ) {
+    // Cancel any pending render/load work that belonged to the previous board.
+    const loadRun = ++drawingLoadRunRef.current;
+    commandRenderRunRef.current += 1;
+
+    if (!drawingCanvas || !context) {
       return;
     }
 
-    /*
-     * Stop any handwriting animation when
-     * changing boards.
-     */
-    handwritingRunRef.current += 1;
+    const hasPendingAiRender =
+      generatedCommand !== null &&
+      generatedCommandVersion > 0 &&
+      completedCommandRenderRef.current[boardId] !==
+        generatedCommandVersion;
 
-    if (
-      handwritingTimerRef.current !== null
-    ) {
-      window.clearTimeout(
-        handwritingTimerRef.current,
-      );
-
-      handwritingTimerRef.current =
-        null;
+    // If this board has a new Gemini scene waiting to render, do not
+    // load an older PNG over it. Start from white and let the
+    // structured-command render effect below paint the new scene.
+    if (hasPendingAiRender) {
+      loadingDrawingRef.current = false;
+      fillBoardWhite();
+      return;
     }
 
     loadingDrawingRef.current = true;
 
     context.save();
-
-    context.globalCompositeOperation =
-      "source-over";
-
+    context.globalCompositeOperation = "source-over";
     context.fillStyle = "#fffef9";
-
     context.fillRect(
       0,
       0,
       drawingCanvas.width,
       drawingCanvas.height,
     );
-
     context.restore();
 
     if (!savedDrawing) {
@@ -457,22 +1429,17 @@ export default function PresentationBoard({
 
     image.onload = () => {
       if (
+        loadRun !== drawingLoadRunRef.current ||
+        activeBoardIdRef.current !== boardId ||
         !drawingCanvas ||
         !context
       ) {
-        loadingDrawingRef.current =
-          false;
-
         return;
       }
 
       context.save();
-
-      context.globalCompositeOperation =
-        "source-over";
-
+      context.globalCompositeOperation = "source-over";
       context.fillStyle = "#fffef9";
-
       context.fillRect(
         0,
         0,
@@ -487,17 +1454,18 @@ export default function PresentationBoard({
         drawingCanvas.width,
         drawingCanvas.height,
       );
-
       context.restore();
 
       loadingDrawingRef.current = false;
-
       refreshTexture();
     };
 
     image.onerror = () => {
-      loadingDrawingRef.current = false;
+      if (loadRun !== drawingLoadRunRef.current) {
+        return;
+      }
 
+      loadingDrawingRef.current = false;
       fillBoardWhite();
     };
 
@@ -505,6 +1473,8 @@ export default function PresentationBoard({
   }, [
     boardId,
     savedDrawing,
+    generatedCommand,
+    generatedCommandVersion,
     drawingCanvas,
     context,
     fillBoardWhite,
@@ -525,19 +1495,10 @@ export default function PresentationBoard({
     previousClearSignalRef.current =
       clearSignal;
 
-    handwritingRunRef.current += 1;
+    drawingLoadRunRef.current += 1;
+    commandRenderRunRef.current += 1;
 
-    if (
-      handwritingTimerRef.current !== null
-    ) {
-      window.clearTimeout(
-        handwritingTimerRef.current,
-      );
-
-      handwritingTimerRef.current = null;
-    }
-
-    delete completedHandwritingRef.current[
+    delete completedCommandRenderRef.current[
       boardId
     ];
 
@@ -551,6 +1512,67 @@ export default function PresentationBoard({
     boardId,
     fillBoardWhite,
     saveCurrentBoard,
+  ]);
+
+  /*
+   * Render Gemini's structured whiteboard command onto the 2D canvas.
+   *
+   * Our application draws text, flowcharts, and charts itself.
+   * For realistic image tools, Gemini Image returns a raster image
+   * which is then painted onto this same board canvas.
+   */
+  useEffect(() => {
+    const alreadyRenderedVersion =
+      completedCommandRenderRef.current[boardId];
+
+    if (
+      generatedCommand === null ||
+      generatedCommandVersion === 0 ||
+      !drawingCanvas ||
+      !context ||
+      alreadyRenderedVersion === generatedCommandVersion
+    ) {
+      return;
+    }
+
+    completedCommandRenderRef.current[boardId] =
+      generatedCommandVersion;
+
+    drawingLoadRunRef.current += 1;
+    const renderRun = ++commandRenderRunRef.current;
+
+    void renderCommandToBoard(
+      generatedCommand,
+      boardId,
+      renderRun,
+    ).catch((error) => {
+      console.error(
+        "Could not render whiteboard command:",
+        error,
+      );
+
+      // Allow this version to retry if rendering failed.
+      if (
+        activeBoardIdRef.current === boardId &&
+        completedCommandRenderRef.current[boardId] ===
+          generatedCommandVersion
+      ) {
+        delete completedCommandRenderRef.current[boardId];
+      }
+    });
+
+    return () => {
+      if (commandRenderRunRef.current === renderRun) {
+        commandRenderRunRef.current += 1;
+      }
+    };
+  }, [
+    generatedCommand,
+    generatedCommandVersion,
+    boardId,
+    drawingCanvas,
+    context,
+    renderCommandToBoard,
   ]);
 
   /*
@@ -606,366 +1628,6 @@ export default function PresentationBoard({
       );
     };
   }, [saveCurrentBoard]);
-
-  /*
-   * Gemini handwriting animation.
-   *
-   * This effect runs only once for each combination
-   * of boardId + generatedTextVersion.
-   */
-  useEffect(() => {
-    const alreadyCompletedVersion =
-      completedHandwritingRef.current[
-      boardId
-      ];
-
-    if (
-      !generatedText.trim() ||
-      generatedTextVersion === 0 ||
-      !drawingCanvas ||
-      !context ||
-      alreadyCompletedVersion ===
-      generatedTextVersion
-    ) {
-      return;
-    }
-
-    /*
-     * Mark this response as started immediately.
-     *
-     * This prevents saving the board image from
-     * causing the effect to restart.
-     */
-    completedHandwritingRef.current[
-      boardId
-    ] = generatedTextVersion;
-
-    handwritingRunRef.current += 1;
-
-    const currentRun =
-      handwritingRunRef.current;
-
-    if (
-      handwritingTimerRef.current !== null
-    ) {
-      window.clearTimeout(
-        handwritingTimerRef.current,
-      );
-
-      handwritingTimerRef.current =
-        null;
-    }
-
-    let cancelled = false;
-
-    async function startHandwriting() {
-      /*
-       * Wait for the handwriting font.
-       * The browser uses cursive when it is missing.
-       */
-      try {
-        await document.fonts.load(
-          '52px "Lixia Handwriting"',
-        );
-      } catch {
-        // Use the fallback cursive font.
-      }
-
-      if (
-        cancelled ||
-        currentRun !==
-        handwritingRunRef.current ||
-        !drawingCanvas ||
-        !context
-      ) {
-        return;
-      }
-
-      const marginX = 95;
-      const marginTop = 75;
-
-      const maxTextWidth =
-        drawingCanvas.width -
-        marginX * 2;
-
-      const titleSize = 66;
-      const bodySize = 46;
-
-      const titleLineHeight = 84;
-      const bodyLineHeight = 60;
-
-      const sourceLines =
-        generatedText
-          .replace(/\r/g, "")
-          .split("\n");
-
-      const instructions:
-        CharacterInstruction[] = [];
-
-      let currentY = marginTop;
-      let visibleLineIndex = 0;
-
-      function addWrappedLine(
-        sourceLine: string,
-        isTitle: boolean,
-      ) {
-        if (
-          !context ||
-          !drawingCanvas
-        ) {
-          return;
-        }
-
-        const fontSize = isTitle
-          ? titleSize
-          : bodySize;
-
-        const lineHeight = isTitle
-          ? titleLineHeight
-          : bodyLineHeight;
-
-        const fontWeight = isTitle
-          ? "600"
-          : "400";
-
-        const font =
-          `${fontWeight} ${fontSize}px ` +
-          `"Lixia Handwriting", cursive`;
-
-        context.font = font;
-
-        const cleanLine = sourceLine
-          .replace(/^[-*]\s*/, "• ")
-          .trim();
-
-        if (!cleanLine) {
-          currentY +=
-            lineHeight * 0.55;
-
-          return;
-        }
-
-        const words =
-          cleanLine.split(/\s+/);
-
-        let currentX = marginX;
-
-        for (const word of words) {
-          const wordWithSpace =
-            `${word} `;
-
-          const wordWidth =
-            context.measureText(
-              wordWithSpace,
-            ).width;
-
-          if (
-            currentX > marginX &&
-            currentX + wordWidth >
-            marginX + maxTextWidth
-          ) {
-            currentX = marginX;
-            currentY += lineHeight;
-          }
-
-          for (
-            const character of wordWithSpace
-          ) {
-            const characterWidth =
-              context.measureText(
-                character,
-              ).width;
-
-            if (
-              currentX > marginX &&
-              currentX +
-              characterWidth >
-              marginX +
-              maxTextWidth
-            ) {
-              currentX = marginX;
-              currentY += lineHeight;
-            }
-
-            if (
-              currentY + lineHeight >
-              drawingCanvas.height -
-              55
-            ) {
-              return;
-            }
-
-            const yJitter =
-              (Math.random() - 0.5) *
-              2.2;
-
-            const rotation =
-              (Math.random() - 0.5) *
-              0.018;
-
-            instructions.push({
-              character,
-              x: currentX,
-              y:
-                currentY +
-                yJitter,
-              font,
-              color: isTitle
-                ? "#312e81"
-                : "#172033",
-              rotation,
-              delay:
-                character === " "
-                  ? 13
-                  : 28 +
-                  Math.random() *
-                  22,
-            });
-
-            currentX +=
-              characterWidth +
-              (Math.random() - 0.5) *
-              0.7;
-          }
-        }
-
-        currentY += lineHeight;
-      }
-
-      for (
-        const sourceLine of sourceLines
-      ) {
-        const hasContent =
-          sourceLine.trim().length > 0;
-
-        const isTitle =
-          hasContent &&
-          visibleLineIndex === 0;
-
-        addWrappedLine(
-          sourceLine,
-          isTitle,
-        );
-
-        if (hasContent) {
-          visibleLineIndex += 1;
-        }
-
-        if (
-          currentY >=
-          drawingCanvas.height - 70
-        ) {
-          break;
-        }
-      }
-
-      let instructionIndex = 0;
-
-      function drawNextCharacter() {
-        if (
-          cancelled ||
-          currentRun !==
-          handwritingRunRef.current ||
-          !context ||
-          !drawingCanvas
-        ) {
-          return;
-        }
-
-        const instruction =
-          instructions[
-          instructionIndex
-          ];
-
-        if (!instruction) {
-          refreshTexture();
-
-          const finishedDrawing =
-            drawingCanvas.toDataURL(
-              "image/png",
-            );
-
-          onDrawingChange(
-            boardId,
-            finishedDrawing,
-          );
-
-          handwritingTimerRef.current =
-            null;
-
-          return;
-        }
-
-        context.save();
-
-        context.globalCompositeOperation =
-          "source-over";
-
-        context.font =
-          instruction.font;
-
-        context.fillStyle =
-          instruction.color;
-
-        context.textBaseline = "top";
-
-        context.translate(
-          instruction.x,
-          instruction.y,
-        );
-
-        context.rotate(
-          instruction.rotation,
-        );
-
-        context.fillText(
-          instruction.character,
-          0,
-          0,
-        );
-
-        context.restore();
-
-        refreshTexture();
-
-        instructionIndex += 1;
-
-        handwritingTimerRef.current =
-          window.setTimeout(
-            drawNextCharacter,
-            instruction.delay,
-          );
-      }
-
-      drawNextCharacter();
-    }
-
-    void startHandwriting();
-
-    return () => {
-      cancelled = true;
-
-      if (
-        handwritingTimerRef.current !==
-        null
-      ) {
-        window.clearTimeout(
-          handwritingTimerRef.current,
-        );
-
-        handwritingTimerRef.current =
-          null;
-      }
-    };
-  }, [
-    generatedText,
-    generatedTextVersion,
-    boardId,
-    drawingCanvas,
-    context,
-    refreshTexture,
-    onDrawingChange,
-  ]);
 
   function getPoint(
     event: ThreeEvent<PointerEvent>,
