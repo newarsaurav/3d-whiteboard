@@ -4,6 +4,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -28,6 +29,7 @@ import StudioEnvironment from "./StudioEnvironment";
 import type {
   Board,
   BoardCommand,
+  TeacherLessonCommand,
 } from "@/types/board";
 
 const BOARD_X = 1.4;
@@ -113,9 +115,12 @@ function looksLikeBoardFollowUp(
     "delete ",
     "move ",
     "replace ",
+    "edit ",
+    "keep ",
     "make it",
     "make this",
     "make that",
+    "make the ",
     "this ",
     "that ",
     " it ",
@@ -125,16 +130,49 @@ function looksLikeBoardFollowUp(
     "beside",
     "next to",
     "on the side",
+    "bigger",
+    "smaller",
+    "left",
+    "right",
     "the chart",
     "the graph",
     "the flowchart",
     "the diagram",
     "the board",
+    "the cat",
+    "the dog",
+    "the image",
+    "the picture",
   ];
 
   return markers.some((marker) =>
     normalized.includes(marker),
   );
+}
+
+function getBoardImageForGemini(
+  board: Board | undefined,
+): string | null {
+  if (!board) {
+    return null;
+  }
+
+  if (
+    typeof board.drawing === "string" &&
+    board.drawing.startsWith("data:image/")
+  ) {
+    return board.drawing;
+  }
+
+  if (
+    board.generatedCommand?.type === "image" &&
+    typeof board.generatedCommand.imageDataUrl === "string" &&
+    board.generatedCommand.imageDataUrl.startsWith("data:image/")
+  ) {
+    return board.generatedCommand.imageDataUrl;
+  }
+
+  return null;
 }
 
 export default function LixiaStudio() {
@@ -148,6 +186,23 @@ export default function LixiaStudio() {
 
   const [assistantError, setAssistantError] =
     useState<string | null>(null);
+
+  const [isTeaching, setIsTeaching] =
+    useState(false);
+
+  const [isTeachingPaused, setIsTeachingPaused] =
+    useState(false);
+
+  const teachingRunRef = useRef(0);
+
+  const teacherAudioContextRef =
+    useRef<AudioContext | null>(null);
+
+  const teacherAbortControllerRef =
+    useRef<AbortController | null>(null);
+
+  const teacherAudioSourcesRef =
+    useRef<Set<AudioBufferSourceNode>>(new Set());
 
   const [boardLayout, setBoardLayout] =
     useState({
@@ -223,6 +278,411 @@ export default function LixiaStudio() {
     [],
   );
 
+  function getTeacherAudioContext(): AudioContext | null {
+    if (typeof window === "undefined") {
+      return null;
+    }
+
+    if (
+      !teacherAudioContextRef.current ||
+      teacherAudioContextRef.current.state === "closed"
+    ) {
+      teacherAudioContextRef.current =
+        new window.AudioContext({
+          sampleRate: 24000,
+        });
+    }
+
+    return teacherAudioContextRef.current;
+  }
+
+  function stopActiveTeacherAudio() {
+    teacherAbortControllerRef.current?.abort();
+    teacherAbortControllerRef.current = null;
+
+    if (
+      typeof window !== "undefined" &&
+      "speechSynthesis" in window
+    ) {
+      window.speechSynthesis.cancel();
+    }
+
+    for (const source of teacherAudioSourcesRef.current) {
+      try {
+        source.stop();
+      } catch {
+        // Source may already be stopped.
+      }
+    }
+
+    teacherAudioSourcesRef.current.clear();
+  }
+
+  function stopTeaching() {
+    teachingRunRef.current += 1;
+    stopActiveTeacherAudio();
+    setIsTeaching(false);
+    setIsTeachingPaused(false);
+  }
+
+  async function pauseTeaching() {
+    const audioContext = teacherAudioContextRef.current;
+
+    if (!isTeaching || !audioContext) {
+      return;
+    }
+
+    if (audioContext.state === "running") {
+      await audioContext.suspend();
+    }
+
+    if (
+      typeof window !== "undefined" &&
+      "speechSynthesis" in window
+    ) {
+      window.speechSynthesis.pause();
+    }
+
+    setIsTeachingPaused(true);
+  }
+
+  async function resumeTeaching() {
+    const audioContext = teacherAudioContextRef.current;
+
+    if (!isTeaching || !audioContext) {
+      return;
+    }
+
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    if (
+      typeof window !== "undefined" &&
+      "speechSynthesis" in window
+    ) {
+      window.speechSynthesis.resume();
+    }
+
+    setIsTeachingPaused(false);
+  }
+
+  function pcm16ToFloat32(
+    bytes: Uint8Array,
+  ): Float32Array {
+    const sampleCount = Math.floor(bytes.byteLength / 2);
+    const samples = new Float32Array(sampleCount);
+    const view = new DataView(
+      bytes.buffer,
+      bytes.byteOffset,
+      sampleCount * 2,
+    );
+
+    for (let index = 0; index < sampleCount; index += 1) {
+      const value = view.getInt16(index * 2, true);
+      samples[index] = value / 32768;
+    }
+
+    return samples;
+  }
+
+  async function speakTeachingSegmentFallback(
+    text: string,
+    language: string,
+    runId: number,
+  ): Promise<void> {
+    return new Promise((resolve) => {
+      if (
+        typeof window === "undefined" ||
+        !("speechSynthesis" in window) ||
+        !text.trim() ||
+        runId !== teachingRunRef.current
+      ) {
+        resolve();
+        return;
+      }
+
+      const synth = window.speechSynthesis;
+      const utterance = new SpeechSynthesisUtterance(text);
+
+      utterance.lang = language || "en-US";
+      utterance.rate = 0.94;
+      utterance.pitch = 1;
+      utterance.volume = 1;
+
+      let settled = false;
+
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        resolve();
+      };
+
+      utterance.onend = finish;
+      utterance.onerror = finish;
+      synth.speak(utterance);
+    });
+  }
+
+  async function speakTeachingSegment(
+    text: string,
+    language: string,
+    runId: number,
+  ): Promise<void> {
+    if (!text.trim() || runId !== teachingRunRef.current) {
+      return;
+    }
+
+    const audioContext = getTeacherAudioContext();
+
+    if (!audioContext) {
+      await speakTeachingSegmentFallback(
+        text,
+        language,
+        runId,
+      );
+      return;
+    }
+
+    try {
+      if (audioContext.state === "suspended" && !isTeachingPaused) {
+        await audioContext.resume();
+      }
+
+      const controller = new AbortController();
+      teacherAbortControllerRef.current = controller;
+
+      const response = await fetch("/api/tts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          text,
+          language,
+        }),
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const data = (await response.json().catch(() => null)) as
+          | { error?: string }
+          | null;
+
+        throw new Error(
+          data?.error ?? "Gemini teacher voice failed.",
+        );
+      }
+
+      if (!response.body) {
+        throw new Error(
+          "Gemini teacher voice returned no audio stream.",
+        );
+      }
+
+      const sampleRate = Number(
+        response.headers.get("X-Audio-Sample-Rate") ?? "24000",
+      );
+
+      const reader = response.body.getReader();
+      const sourceEndPromises: Promise<void>[] = [];
+
+      let leftover = new Uint8Array(0);
+      let nextStartTime = Math.max(
+        audioContext.currentTime + 0.08,
+        audioContext.currentTime,
+      );
+      let receivedAudio = false;
+
+      while (true) {
+        if (runId !== teachingRunRef.current) {
+          await reader.cancel();
+          return;
+        }
+
+        const { value, done } = await reader.read();
+
+        if (done) {
+          break;
+        }
+
+        if (!value || value.byteLength === 0) {
+          continue;
+        }
+
+        const merged = new Uint8Array(
+          leftover.byteLength + value.byteLength,
+        );
+
+        merged.set(leftover, 0);
+        merged.set(value, leftover.byteLength);
+
+        const usableLength =
+          merged.byteLength - (merged.byteLength % 2);
+
+        if (usableLength === 0) {
+          leftover = merged;
+          continue;
+        }
+
+        const usable = merged.subarray(0, usableLength);
+        leftover = merged.slice(usableLength);
+
+        const floatSamples = pcm16ToFloat32(usable);
+
+        if (floatSamples.length === 0) {
+          continue;
+        }
+
+        receivedAudio = true;
+
+        const audioBuffer = audioContext.createBuffer(
+          1,
+          floatSamples.length,
+          sampleRate,
+        );
+
+        audioBuffer.copyToChannel(floatSamples, 0);
+
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+
+        teacherAudioSourcesRef.current.add(source);
+
+        const ended = new Promise<void>((resolve) => {
+          source.onended = () => {
+            teacherAudioSourcesRef.current.delete(source);
+            resolve();
+          };
+        });
+
+        sourceEndPromises.push(ended);
+        source.start(nextStartTime);
+        nextStartTime += audioBuffer.duration;
+      }
+
+      if (!receivedAudio) {
+        throw new Error(
+          "Gemini teacher voice returned an empty audio stream.",
+        );
+      }
+
+      await Promise.all(sourceEndPromises);
+    } catch (error) {
+      if (
+        runId !== teachingRunRef.current ||
+        (error instanceof DOMException && error.name === "AbortError")
+      ) {
+        return;
+      }
+
+      console.warn(
+        "Gemini TTS unavailable; using browser voice fallback.",
+        error,
+      );
+
+      await speakTeachingSegmentFallback(
+        text,
+        language,
+        runId,
+      );
+    } finally {
+      if (
+        teacherAbortControllerRef.current?.signal.aborted ||
+        runId === teachingRunRef.current
+      ) {
+        teacherAbortControllerRef.current = null;
+      }
+    }
+  }
+
+  async function runTeacherLesson(
+    boardId: number,
+    lesson: TeacherLessonCommand,
+  ) {
+    stopTeaching();
+
+    const runId = teachingRunRef.current + 1;
+    teachingRunRef.current = runId;
+    setIsTeaching(true);
+    setIsTeachingPaused(false);
+
+    const audioContext = getTeacherAudioContext();
+
+    if (audioContext?.state === "suspended") {
+      try {
+        await audioContext.resume();
+      } catch {
+        // The segment function will use the browser fallback if needed.
+      }
+    }
+
+    try {
+      for (const segment of lesson.segments) {
+        if (runId !== teachingRunRef.current) {
+          return;
+        }
+
+        setBoards((currentBoards) =>
+          currentBoards.map((board) =>
+            board.id === boardId
+              ? {
+                  ...board,
+                  generatedCommand: segment.board,
+                  generatedCommandVersion:
+                    board.generatedCommandVersion + 1,
+                }
+              : board,
+          ),
+        );
+
+        await new Promise<void>((resolve) => {
+          window.setTimeout(resolve, 180);
+        });
+
+        if (runId !== teachingRunRef.current) {
+          return;
+        }
+
+        await speakTeachingSegment(
+          segment.narration,
+          lesson.language ?? "en-US",
+          runId,
+        );
+      }
+    } finally {
+      if (runId === teachingRunRef.current) {
+        setIsTeaching(false);
+        setIsTeachingPaused(false);
+      }
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      teachingRunRef.current += 1;
+      stopActiveTeacherAudio();
+
+      if (
+        typeof window !== "undefined" &&
+        "speechSynthesis" in window
+      ) {
+        window.speechSynthesis.cancel();
+      }
+
+      const audioContext = teacherAudioContextRef.current;
+      teacherAudioContextRef.current = null;
+
+      if (audioContext && audioContext.state !== "closed") {
+        void audioContext.close();
+      }
+    };
+  }, []);
+
   function toggleCameraMode() {
     setCameraMode(
       (currentMode) => !currentMode,
@@ -250,6 +710,10 @@ export default function LixiaStudio() {
   }
 
   function selectBoard(boardId: number) {
+    if (boardId !== activeBoardId) {
+      stopTeaching();
+    }
+
     setActiveBoardId(boardId);
   }
 
@@ -346,6 +810,24 @@ export default function LixiaStudio() {
     }
 
     /*
+     * Unlock Web Audio while this function is still running from the
+     * user's submit/click gesture. Browsers may block audio if the
+     * AudioContext is first resumed only after the Gemini request ends.
+     */
+    const teacherAudioContext = getTeacherAudioContext();
+
+    if (teacherAudioContext?.state === "suspended") {
+      void teacherAudioContext.resume().catch(() => {
+        // If the browser still blocks it, the pause/resume button is
+        // another user gesture and can resume it later.
+      });
+    }
+
+    if (isTeaching) {
+      stopTeaching();
+    }
+
+    /*
      * Very obvious board commands do not need Gemini at all.
      * This makes them instant and saves an API request.
      */
@@ -377,12 +859,24 @@ export default function LixiaStudio() {
 
     /*
      * Sending a 1600x900 PNG on every request adds latency.
-     * New standalone questions such as "what is silver?" do not
-     * need it. Follow-up/edit language does, so only attach the
-     * board screenshot when it is likely useful.
+     * For most text/chart requests, only attach it when the prompt
+     * looks like a follow-up.
+     *
+     * Important exception: if the current board already contains an
+     * AI-generated image, always provide an image context source.
+     * Otherwise requests such as "make the dog smaller" may route to
+     * edit_board_image without an actual image to edit.
+     *
+     * If the board snapshot has not been saved yet, fall back to the
+     * current generated image data URL.
      */
+    const boardImageForGemini =
+      getBoardImageForGemini(targetBoard);
+
     const sendBoardImage =
-      looksLikeBoardFollowUp(prompt);
+      Boolean(boardImageForGemini) &&
+      (looksLikeBoardFollowUp(prompt) ||
+        targetBoard.generatedCommand?.type === "image");
 
     setIsGenerating(true);
     setAssistantError(null);
@@ -398,14 +892,14 @@ export default function LixiaStudio() {
           currentCommand:
             targetBoard.generatedCommand,
           boardImage: sendBoardImage
-            ? targetBoard.drawing
+            ? boardImageForGemini
             : null,
         }),
       });
 
       const data = (await response.json()) as {
         tool?: string;
-        command?: BoardCommand;
+        command?: BoardCommand | TeacherLessonCommand;
         error?: string;
       };
 
@@ -421,13 +915,26 @@ export default function LixiaStudio() {
         );
       }
 
-      // Store the result only on the board that started the request.
+      const command = data.command;
+
+      if (command.type === "teach_lesson") {
+        setAssistantPrompt("");
+
+        void runTeacherLesson(
+          targetBoardId,
+          command,
+        );
+
+        return;
+      }
+
+      // command is now narrowed to BoardCommand.
       setBoards((currentBoards) =>
         currentBoards.map((board) =>
           board.id === targetBoardId
             ? {
                 ...board,
-                generatedCommand: data.command ?? null,
+                generatedCommand: command,
                 generatedCommandVersion:
                   board.generatedCommandVersion + 1,
               }
@@ -595,7 +1102,11 @@ export default function LixiaStudio() {
               <strong>Lixia</strong>
               <span>
                 <span className="online-dot" />
-                Ready to help
+                {isTeaching
+                  ? isTeachingPaused
+                    ? "Lesson paused"
+                    : "Teaching..."
+                  : "Ready to help"}
               </span>
             </div>
           </div>
@@ -626,14 +1137,48 @@ export default function LixiaStudio() {
               }
             />
 
-            <button
-              type="button"
-              className="assistant-mic-button"
-              title="Microphone will be added later"
-              disabled={isGenerating}
-            >
-              🎤
-            </button>
+            {isTeaching ? (
+              <>
+                <button
+                  type="button"
+                  className="assistant-mic-button"
+                  title={
+                    isTeachingPaused
+                      ? "Resume lesson"
+                      : "Pause lesson"
+                  }
+                  disabled={isGenerating}
+                  onClick={() => {
+                    if (isTeachingPaused) {
+                      void resumeTeaching();
+                    } else {
+                      void pauseTeaching();
+                    }
+                  }}
+                >
+                  {isTeachingPaused ? "▶" : "⏸"}
+                </button>
+
+                <button
+                  type="button"
+                  className="assistant-mic-button"
+                  title="Stop lesson"
+                  disabled={isGenerating}
+                  onClick={stopTeaching}
+                >
+                  ⏹
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="assistant-mic-button"
+                title="Microphone will be added later"
+                disabled={isGenerating}
+              >
+                🎤
+              </button>
+            )}
 
             <button
               type="submit"

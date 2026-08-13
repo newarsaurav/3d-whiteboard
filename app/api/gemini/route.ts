@@ -12,6 +12,7 @@ import type {
   BoardFlowchartCommand,
   BoardImageCommand,
   BoardTextCommand,
+  TeacherLessonCommand,
   FlowchartEdge,
   FlowchartNode,
 } from "@/types/board";
@@ -73,13 +74,79 @@ const writeTextDeclaration: FunctionDeclaration = {
           type: "string",
         },
       },
+      formulas: {
+        type: "array",
+        description:
+          "Optional important formulas/equations to show prominently on the board. Use symbolic notation such as a = Δv / Δt. Keep each formula short.",
+        items: {
+          type: "string",
+        },
+      },
       note: {
         type: "string",
         description:
-          "Optional one-line takeaway, formula, or important note.",
+          "Optional one-line takeaway, worked example, or important note.",
       },
     },
     required: ["title", "bullets"],
+  },
+};
+
+const teachLessonDeclaration: FunctionDeclaration = {
+  name: "teach_lesson",
+  description:
+    "Teach a concept like a real teacher: speak a detailed but clear explanation while progressively updating the whiteboard with definitions, formulas, and examples. Use when the user asks to explain, teach, walk through, or help them understand a concept in some depth. Do not use for a simple one-line factual answer.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      topic: {
+        type: "string",
+        description: "Short lesson topic.",
+      },
+      language: {
+        type: "string",
+        description:
+          "BCP-47 language code for narration, for example en-US. Match the user's language when practical.",
+      },
+      segments: {
+        type: "array",
+        description:
+          "Two to six sequential teaching segments. Each segment contains natural spoken narration and the COMPLETE cumulative board state that should be visible while that narration is spoken.",
+        items: {
+          type: "object",
+          properties: {
+            narration: {
+              type: "string",
+              description:
+                "Natural teacher-style speech, usually 1-4 sentences. Explain symbols in spoken words instead of reading raw notation awkwardly.",
+            },
+            boardTitle: {
+              type: "string",
+              description: "Short title currently visible on the board.",
+            },
+            boardBullets: {
+              type: "array",
+              description:
+                "Complete cumulative short bullet list visible at this point in the lesson.",
+              items: { type: "string" },
+            },
+            formulas: {
+              type: "array",
+              description:
+                "Complete cumulative list of important formulas visible at this point, using compact mathematical notation.",
+              items: { type: "string" },
+            },
+            note: {
+              type: "string",
+              description:
+                "Optional worked example, key takeaway, or short teacher note visible on the board.",
+            },
+          },
+          required: ["narration", "boardTitle", "boardBullets"],
+        },
+      },
+    },
+    required: ["topic", "segments"],
   },
 };
 
@@ -189,7 +256,7 @@ const plotWeatherHistoryDeclaration: FunctionDeclaration = {
 const generateImageDeclaration: FunctionDeclaration = {
   name: "generate_image",
   description:
-    "Generate a new realistic or illustrated image for the whiteboard. Use this for requests such as draw/show/create/generate a cat, dog, person, object, scene, photo, or other visual that should look like a real image rather than a flowchart or simple diagram.",
+    "Generate a new image for the whiteboard. By default, make it look like a hand-drawn whiteboard doodle or marker sketch. Only make it realistic/photo-like when the user explicitly asks for realistic, photo, or photorealistic style. Use this for requests such as draw/show/create/generate a cat, dog, person, object, scene, or other visual that should be an image rather than a flowchart or simple text answer.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -211,7 +278,7 @@ const generateImageDeclaration: FunctionDeclaration = {
 const editBoardImageDeclaration: FunctionDeclaration = {
   name: "edit_board_image",
   description:
-    "Edit the CURRENT visible whiteboard image. Use this for visual follow-ups such as add a dog beside that cat, remove the tree, change its color, make the cat bigger, move it left, or otherwise modify an image already on the board. Preserve everything the user did not ask to change.",
+    "Edit the CURRENT visible whiteboard image. By default, preserve or create a hand-drawn whiteboard doodle/marker-sketch look unless the user explicitly asks for realistic/photo style. Use this for visual follow-ups such as add a dog beside that cat, remove the tree, change its color, make the cat bigger, move it left, or otherwise modify an image already on the board. Preserve everything the user did not ask to change.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -287,6 +354,13 @@ function buildTextCommand(
         .slice(0, 8)
     : [];
 
+  const formulas = Array.isArray(args.formulas)
+    ? args.formulas
+        .map((item) => readString(item, "", 120))
+        .filter(Boolean)
+        .slice(0, 4)
+    : [];
+
   const note = readString(args.note, "", 220);
 
   return {
@@ -296,7 +370,83 @@ function buildTextCommand(
       bullets.length > 0
         ? bullets
         : ["No whiteboard content was returned."],
+    ...(formulas.length > 0 ? { formulas } : {}),
     ...(note ? { note } : {}),
+  };
+}
+
+function buildTeacherLessonCommand(
+  args: Record<string, unknown>,
+): TeacherLessonCommand {
+  const topic = readString(args.topic, "Lesson", 90);
+  const language = readString(args.language, "en-US", 24);
+  const rawSegments = Array.isArray(args.segments)
+    ? args.segments
+    : [];
+
+  const segments = rawSegments
+    .slice(0, 6)
+    .map((rawSegment, index) => {
+      const segment =
+        rawSegment && typeof rawSegment === "object"
+          ? (rawSegment as Record<string, unknown>)
+          : {};
+
+      const narration = readString(
+        segment.narration,
+        "",
+        900,
+      );
+
+      const bullets = Array.isArray(segment.boardBullets)
+        ? segment.boardBullets
+            .map((item) => readString(item, "", 180))
+            .filter(Boolean)
+            .slice(0, 7)
+        : [];
+
+      const formulas = Array.isArray(segment.formulas)
+        ? segment.formulas
+            .map((item) => readString(item, "", 120))
+            .filter(Boolean)
+            .slice(0, 4)
+        : [];
+
+      const note = readString(segment.note, "", 220);
+
+      return {
+        narration,
+        board: {
+          type: "write_text" as const,
+          title: readString(
+            segment.boardTitle,
+            topic,
+            90,
+          ),
+          bullets:
+            bullets.length > 0
+              ? bullets
+              : [
+                  index === 0
+                    ? "Introduction to " + topic
+                    : "Continue learning " + topic,
+                ],
+          ...(formulas.length > 0 ? { formulas } : {}),
+          ...(note ? { note } : {}),
+        },
+      };
+    })
+    .filter((segment) => segment.narration.length > 0);
+
+  if (segments.length === 0) {
+    throw new Error("Gemini returned an empty teaching lesson.");
+  }
+
+  return {
+    type: "teach_lesson",
+    topic,
+    ...(language ? { language } : {}),
+    segments,
   };
 }
 
@@ -610,6 +760,24 @@ async function buildWeatherChart(
   };
 }
 
+function requestNeedsRealisticImage(text: string): boolean {
+  const normalized = text.toLowerCase();
+
+  const realisticMarkers = [
+    "realistic",
+    "photo",
+    "photorealistic",
+    "photographic",
+    "lifelike",
+    "3d render",
+    "highly detailed",
+  ];
+
+  return realisticMarkers.some((marker) =>
+    normalized.includes(marker),
+  );
+}
+
 async function buildImageCommand(
   ai: GoogleGenAI,
   args: Record<string, unknown>,
@@ -637,18 +805,37 @@ async function buildImageCommand(
     );
   }
 
+  const prefersRealistic =
+    requestNeedsRealisticImage(requestedText);
+
+  const styleInstructions = prefersRealistic
+    ? [
+        "Style: realistic / photo-like.",
+        "Render the subject convincingly with natural form and detail.",
+      ].join("\n")
+    : [
+        "Style: hand-drawn classroom whiteboard doodle.",
+        "Make it look like a teacher sketched it on a school whiteboard using marker pens.",
+        "Use simple marker strokes, slightly imperfect hand-drawn lines, and a clean doodle/illustration feel.",
+        "Prefer dark gray/black outlines with minimal blue/red/green marker accents when helpful.",
+        "Keep the background plain white or very close to white so it blends into the board.",
+        "Do NOT make it look like a pasted photo, glossy clip-art, or polished poster.",
+      ].join("\n");
+
   const imageInstructions =
     mode === "edit"
       ? `
 Edit the attached current whiteboard image according to this instruction:
 ${requestedText}
 
+${styleInstructions}
+
 Rules:
 - Preserve every existing element that the user did NOT ask to change.
 - Keep the same overall 16:9 whiteboard composition.
 - Do not replace, restyle, or distort unrelated content.
 - If adding an object, place it naturally without covering important existing content.
-- Make requested animals, people, objects, and scenes visually convincing and realistic unless the user asks for another style.
+- If the current board already looks hand-drawn, continue in the same whiteboard-doodle style unless the user explicitly asks for realistic style.
 - Do not add new text, labels, borders, watermarks, or captions unless explicitly requested.
 - Return only the edited image.
       `.trim()
@@ -658,8 +845,9 @@ Create an image for display on a 16:9 interactive teaching whiteboard.
 User request:
 ${requestedText}
 
+${styleInstructions}
+
 Rules:
-- Make animals, people, objects, and scenes visually convincing and realistic unless the user asks for another style.
 - Compose the subject clearly with comfortable margins so it looks good on a whiteboard.
 - Avoid unnecessary text, labels, frames, watermarks, or captions.
 - Use a clean neutral/light background when the user does not specify a setting.
@@ -805,11 +993,12 @@ You MUST call exactly one available function.
 Do not answer with normal prose.
 
 ROUTING RULES:
-- write_text: definitions, explanations, theory, short lessons, factual questions.
+- write_text: short definitions, concise factual answers, or brief explanations that do NOT need a spoken lesson.
+- teach_lesson: detailed explanations, teaching, walkthroughs, formulas, worked examples, or when the user says explain/teach/help me understand. It should sound like a real teacher while the board progressively fills in.
 - draw_flowchart: flowcharts, workflows, processes, decision trees, sequences with arrows.
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
-- generate_image: create a NEW realistic/illustrated visual such as a cat, dog, car, person, object, landscape, photo, or scene.
-- edit_board_image: modify a visual already visible on the board, for example "add a dog beside that cat", "remove the tree", or "make the cat bigger".
+- generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
+- edit_board_image: modify a visual already visible on the board, for example "add a dog beside that cat", "remove the tree", or "make the cat bigger". By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
 
 BOARD CONTEXT:
 - The current structured board content is included below.
@@ -820,8 +1009,13 @@ BOARD CONTEXT:
 - For flowcharts, use row 0-5 and column 0-3 and avoid overlapping grid positions.
 - For weather requests such as "KTM", normalize the location to a geocodable place name such as "Kathmandu, Nepal" when you are confident.
 - "last 10 days till today" means days=10.
-- For realistic pictures and object/animal/person drawings, NEVER fake them with text, SVG, or a flowchart. Use generate_image or edit_board_image.
+- For object/animal/person drawings, NEVER fake them with text, SVG, or a flowchart. Use generate_image or edit_board_image.
+- Default image style should be a whiteboard doodle / marker sketch. Only choose realistic/photo style when the user clearly asks for it.
 - Use edit_board_image only when the request refers to visual content already on the current board.
+- For teach_lesson, make every segment board state cumulative: later segments must keep useful content/formulas from earlier segments while adding the next idea.
+- Keep teach_lesson narration conversational and more detailed than the board. The board is the concise visual summary; narration is the fuller explanation.
+- For formulas, put symbolic notation on the board, but phrase the narration naturally. Example: board shows "a = Δv / Δt" while narration says "acceleration equals change in velocity divided by change in time."
+- Prefer 3-5 lesson segments so the learner sees the board develop step by step.
 
 Current structured board content:
 ${currentCommand}
@@ -856,6 +1050,7 @@ ${prompt}
           {
             functionDeclarations: [
               writeTextDeclaration,
+              teachLessonDeclaration,
               drawFlowchartDeclaration,
               plotWeatherHistoryDeclaration,
               generateImageDeclaration,
@@ -900,10 +1095,12 @@ ${prompt}
         ? (functionCall.args as Record<string, unknown>)
         : {};
 
-    let command: BoardCommand;
+    let command: BoardCommand | TeacherLessonCommand;
 
     if (functionCall.name === "write_text") {
       command = buildTextCommand(args);
+    } else if (functionCall.name === "teach_lesson") {
+      command = buildTeacherLessonCommand(args);
     } else if (functionCall.name === "draw_flowchart") {
       command = buildFlowchartCommand(args);
     } else if (functionCall.name === "plot_weather_history") {

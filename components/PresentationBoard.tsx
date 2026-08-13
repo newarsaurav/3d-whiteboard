@@ -380,6 +380,59 @@ function renderTextCommand(
     currentY += Math.max(1, lines.length) * 54 + 18;
   }
 
+  if (command.formulas && command.formulas.length > 0 && currentY < 730) {
+    context.save();
+
+    context.fillStyle = "#4338ca";
+    context.font =
+      '600 30px "Lixia Handwriting", "Comic Sans MS", cursive';
+    context.fillText("Formula", marginX, currentY + 2);
+
+    currentY += 48;
+
+    for (const formula of command.formulas.slice(0, 4)) {
+      if (currentY + 78 > 770) {
+        break;
+      }
+
+      context.fillStyle = "#eef2ff";
+      context.strokeStyle = "#818cf8";
+      context.lineWidth = 3;
+
+      context.beginPath();
+      context.roundRect(
+        marginX,
+        currentY,
+        Math.min(
+          CANVAS_WIDTH - marginX * 2,
+          980,
+        ),
+        68,
+        16,
+      );
+      context.fill();
+      context.stroke();
+
+      context.fillStyle = "#1e1b4b";
+      context.font =
+        '600 46px "Lixia Handwriting", "Comic Sans MS", cursive';
+      context.textAlign = "left";
+      context.textBaseline = "middle";
+      context.fillText(
+        formula,
+        marginX + 28,
+        currentY + 34,
+      );
+
+      currentY += 82;
+    }
+
+    context.restore();
+
+    context.textAlign = "left";
+    context.textBaseline = "top";
+  }
+
   if (command.note && currentY < 785) {
     context.save();
     context.fillStyle = "#eef2ff";

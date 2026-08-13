@@ -21,7 +21,20 @@ export interface BoardTextCommand {
   type: "write_text";
   title: string;
   bullets: string[];
+  formulas?: string[];
   note?: string;
+}
+
+export interface TeacherLessonSegment {
+  narration: string;
+  board: BoardTextCommand;
+}
+
+export interface TeacherLessonCommand {
+  type: "teach_lesson";
+  topic: string;
+  language?: string;
+  segments: TeacherLessonSegment[];
 }
 
 export interface BoardFlowchartCommand {
