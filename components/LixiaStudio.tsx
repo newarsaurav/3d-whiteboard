@@ -19,7 +19,12 @@ import {
 } from "@react-three/drei";
 
 import MikeModel from "./MikeModel";
-import type { MikeBounds } from "./MikeModel";
+import type {
+  MikeAnimationApi,
+  MikeBounds,
+} from "./MikeModel";
+
+import { presentationDirector } from "@lixia/mike-animation";
 
 import PresentationBoard from "./PresentationBoard";
 import type { DrawingTool } from "./PresentationBoard";
@@ -38,6 +43,33 @@ const BOARD_Z = -0.7;
 const HIP_RATIO = 0.42;
 const BELOW_HIP_OFFSET = 0.25;
 const ABOVE_HEAD_OFFSET = 0.75;
+
+/**
+ * When Gemini does not name a gesture for a lesson segment, rotate
+ * through natural teaching gestures so Mike never freezes mid-lesson.
+ */
+const FALLBACK_LESSON_GESTURES = [
+  "explain",
+  "point",
+  "emphasize",
+  "offer",
+] as const;
+
+/** Deterministic gesture for single (non-lesson) board responses. */
+function gestureForBoardCommand(
+  command: BoardCommand,
+): string {
+  switch (command.type) {
+    case "flowchart":
+      return "point";
+    case "chart":
+      return "reveal";
+    case "image":
+      return command.mode === "edit" ? "approve" : "reveal";
+    default:
+      return "explain";
+  }
+}
 
 
 
@@ -285,6 +317,65 @@ export default function LixiaStudio() {
   const teacherAudioSourcesRef =
     useRef<Set<AudioBufferSourceNode>>(new Set());
 
+  const mikeApiRef =
+    useRef<MikeAnimationApi | null>(null);
+
+  const handleMikeReady = useCallback(
+    (api: MikeAnimationApi) => {
+      mikeApiRef.current = api;
+    },
+    [],
+  );
+
+  /**
+   * Resolve a gesture intent through the presentation director (which
+   * only admits approved registry clips) and play it on the right body
+   * layer: additive upper-body gestures blend over the idle, full-body
+   * clips (wave, point, think) replace it and return to idle when done.
+   */
+  const playGestureIntent = useCallback(
+    (intent: string | null | undefined) => {
+      const mike = mikeApiRef.current;
+
+      if (!mike || !intent) {
+        return;
+      }
+
+      try {
+        const plan = presentationDirector.resolve({
+          gesture: intent,
+        });
+
+        if (plan.mode === "idle") {
+          mike.playWaiting();
+          return;
+        }
+
+        if (plan.mode !== "play" || !plan.animation_id) {
+          return;
+        }
+
+        if (plan.record?.body_layer === "upper_body") {
+          void mike.playGesture(plan.animation_id, {
+            repeats: 1,
+          });
+        } else {
+          void mike.playAnimation(plan.animation_id, {
+            repeats: 1,
+          });
+        }
+      } catch (error) {
+        // Unknown intents are non-fatal: Mike simply keeps his
+        // current pose instead of interrupting the lesson.
+        console.warn(
+          `Skipping unknown gesture intent "${intent}":`,
+          error,
+        );
+      }
+    },
+    [],
+  );
+
   const [boardLayout, setBoardLayout] =
     useState({
       y: 2.6,
@@ -404,6 +495,8 @@ export default function LixiaStudio() {
     stopActiveTeacherAudio();
     setIsTeaching(false);
     setIsTeachingPaused(false);
+    mikeApiRef.current?.setSpeaking(false);
+    mikeApiRef.current?.playWaiting();
   }
 
   async function pauseTeaching() {
@@ -450,7 +543,7 @@ export default function LixiaStudio() {
 
   function pcm16ToFloat32(
     bytes: Uint8Array,
-  ): Float32Array {
+  ): Float32Array<ArrayBuffer> {
     const sampleCount = Math.floor(bytes.byteLength / 2);
     const samples = new Float32Array(sampleCount);
     const view = new DataView(
@@ -718,6 +811,9 @@ export default function LixiaStudio() {
         return;
       }
 
+      mikeApiRef.current?.setSpeaking(true);
+      playGestureIntent(gestureForBoardCommand(command));
+
       await speakTeachingSegment(
         narration,
         language,
@@ -727,6 +823,8 @@ export default function LixiaStudio() {
       if (runId === teachingRunRef.current) {
         setIsTeaching(false);
         setIsTeachingPaused(false);
+        mikeApiRef.current?.setSpeaking(false);
+        mikeApiRef.current?.playWaiting();
       }
     }
   }
@@ -753,7 +851,12 @@ export default function LixiaStudio() {
     }
 
     try {
-      for (const segment of lesson.segments) {
+      mikeApiRef.current?.setSpeaking(true);
+
+      for (const [
+        segmentIndex,
+        segment,
+      ] of lesson.segments.entries()) {
         if (runId !== teachingRunRef.current) {
           return;
         }
@@ -779,6 +882,13 @@ export default function LixiaStudio() {
           return;
         }
 
+        playGestureIntent(
+          segment.gesture ??
+            FALLBACK_LESSON_GESTURES[
+              segmentIndex % FALLBACK_LESSON_GESTURES.length
+            ],
+        );
+
         await speakTeachingSegment(
           segment.narration,
           lesson.language ?? "en-US",
@@ -789,6 +899,8 @@ export default function LixiaStudio() {
       if (runId === teachingRunRef.current) {
         setIsTeaching(false);
         setIsTeachingPaused(false);
+        mikeApiRef.current?.setSpeaking(false);
+        mikeApiRef.current?.playWaiting();
       }
     }
   }
@@ -1381,6 +1493,7 @@ export default function LixiaStudio() {
             onMeasured={
               handleMikeMeasured
             }
+            onReady={handleMikeReady}
           />
           <PresentationBoard
             position={[
