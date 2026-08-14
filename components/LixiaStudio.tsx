@@ -175,6 +175,87 @@ function getBoardImageForGemini(
   return null;
 }
 
+function makeFormulaSpeakable(formula: string): string {
+  return formula
+    .replace(/Δ/g, " delta " )
+    .replace(/²/g, " squared " )
+    .replace(/³/g, " cubed " )
+    .replace(/=/g, " equals " )
+    .replace(/\//g, " divided by " )
+    .replace(/\*/g, " times " )
+    .replace(/\+/g, " plus " )
+    .replace(/-/g, " minus " )
+    .replace(/\s+/g, " " )
+    .trim();
+}
+
+function buildSpokenResponse(command: BoardCommand): string {
+  if (command.type === "write_text") {
+    const parts: string[] = [];
+
+    if (command.title.trim()) {
+      parts.push(command.title.trim());
+    }
+
+    for (const bullet of command.bullets) {
+      const clean = bullet.trim();
+      if (clean) {
+        parts.push(clean);
+      }
+    }
+
+    if (command.formulas?.length) {
+      for (const formula of command.formulas) {
+        const clean = formula.trim();
+        if (clean) {
+          parts.push(`The formula is ${makeFormulaSpeakable(clean)}.`);
+        }
+      }
+    }
+
+    if (command.note?.trim()) {
+      parts.push(command.note.trim());
+    }
+
+    return parts.join(". " );
+  }
+
+  if (command.type === "flowchart") {
+    const orderedNodes = [...command.nodes]
+      .sort((a, b) =>
+        a.row === b.row
+          ? a.column - b.column
+          : a.row - b.row,
+      )
+      .map((node) => node.label.trim())
+      .filter(Boolean);
+
+    const nodeSummary = orderedNodes.slice(0, 8).join(", then " );
+
+    return nodeSummary
+      ? `Here is the ${command.title} flowchart. The main flow is ${nodeSummary}.`
+      : `I have drawn the ${command.title} flowchart on the board.`;
+  }
+
+  if (command.type === "chart") {
+    const sourceText = command.source
+      ? ` The data source is ${command.source}.`
+      : "";
+
+    return `I have plotted ${command.title} on the board.${sourceText}`;
+  }
+
+  if (command.type === "image") {
+    const subject = command.title?.trim() || "the requested drawing";
+
+    return command.mode === "edit"
+      ? `I have updated ${subject} on the whiteboard.`
+      : `I have drawn ${subject} on the whiteboard.`;
+  }
+
+  return "I have updated the whiteboard.";
+}
+
 export default function LixiaStudio() {
 
 
@@ -600,6 +681,56 @@ export default function LixiaStudio() {
     }
   }
 
+  async function speakSingleBoardResponse(
+    command: BoardCommand,
+    language = "en-US",
+  ) {
+    const narration = buildSpokenResponse(command);
+
+    if (!narration.trim()) {
+      return;
+    }
+
+    stopTeaching();
+
+    const runId = teachingRunRef.current + 1;
+    teachingRunRef.current = runId;
+    setIsTeaching(true);
+    setIsTeachingPaused(false);
+
+    const audioContext = getTeacherAudioContext();
+
+    if (audioContext?.state === "suspended") {
+      try {
+        await audioContext.resume();
+      } catch {
+        // TTS playback will fall back to browser speech if needed.
+      }
+    }
+
+    try {
+      // Let React paint the board update before Lixia begins speaking.
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 120);
+      });
+
+      if (runId !== teachingRunRef.current) {
+        return;
+      }
+
+      await speakTeachingSegment(
+        narration,
+        language,
+        runId,
+      );
+    } finally {
+      if (runId === teachingRunRef.current) {
+        setIsTeaching(false);
+        setIsTeachingPaused(false);
+      }
+    }
+  }
+
   async function runTeacherLesson(
     boardId: number,
     lesson: TeacherLessonCommand,
@@ -837,6 +968,14 @@ export default function LixiaStudio() {
       clearBoard();
       setAssistantPrompt("");
       setAssistantError(null);
+
+      const quickCommand: BoardCommand = {
+        type: "write_text",
+        title: "Board cleared",
+        bullets: [],
+      };
+
+      void speakSingleBoardResponse(quickCommand);
       return;
     }
 
@@ -844,6 +983,14 @@ export default function LixiaStudio() {
       addBoard();
       setAssistantPrompt("");
       setAssistantError(null);
+
+      const quickCommand: BoardCommand = {
+        type: "write_text",
+        title: "New board created",
+        bullets: [],
+      };
+
+      void speakSingleBoardResponse(quickCommand);
       return;
     }
 
@@ -941,6 +1088,11 @@ export default function LixiaStudio() {
             : board,
         ),
       );
+
+      // Every normal response is spoken too. The existing structured
+      // command becomes a concise narration, so this adds no extra
+      // Gemini reasoning call before TTS starts.
+      void speakSingleBoardResponse(command);
 
       setAssistantPrompt("");
     } catch (error) {
@@ -1104,8 +1256,8 @@ export default function LixiaStudio() {
                 <span className="online-dot" />
                 {isTeaching
                   ? isTeachingPaused
-                    ? "Lesson paused"
-                    : "Teaching..."
+                    ? "Voice paused"
+                    : "Speaking..."
                   : "Ready to help"}
               </span>
             </div>
@@ -1144,8 +1296,8 @@ export default function LixiaStudio() {
                   className="assistant-mic-button"
                   title={
                     isTeachingPaused
-                      ? "Resume lesson"
-                      : "Pause lesson"
+                      ? "Resume voice"
+                      : "Pause voice"
                   }
                   disabled={isGenerating}
                   onClick={() => {
@@ -1162,7 +1314,7 @@ export default function LixiaStudio() {
                 <button
                   type="button"
                   className="assistant-mic-button"
-                  title="Stop lesson"
+                  title="Stop voice"
                   disabled={isGenerating}
                   onClick={stopTeaching}
                 >
