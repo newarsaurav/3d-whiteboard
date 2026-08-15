@@ -329,9 +329,9 @@ export default function LixiaStudio() {
 
   /**
    * Resolve a gesture intent through the presentation director (which
-   * only admits approved registry clips) and play it on the right body
-   * layer: additive upper-body gestures blend over the idle, full-body
-   * clips (wave, point, think) replace it and return to idle when done.
+   * only admits approved registry clips). While Mike is speaking, the
+   * model keeps a looping talk pose and chains hand gestures for the
+   * whole narration — this call just picks the next meaningful clip.
    */
   const playGestureIntent = useCallback(
     (intent: string | null | undefined) => {
