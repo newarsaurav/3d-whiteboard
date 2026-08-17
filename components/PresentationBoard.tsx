@@ -36,9 +36,19 @@ interface PresentationBoardProps {
   generatedCommand: BoardCommand | null;
   generatedCommandVersion: number;
 
+  // 10 = slow, 100 = fast.
+  writingSpeed: number;
+  drawingSpeed: number;
+  animationPaused?: boolean;
+
   onDrawingChange: (
     boardId: number,
     drawing: string,
+  ) => void;
+
+  onCommandRenderComplete?: (
+    boardId: number,
+    version: number,
   ) => void;
 
 }
@@ -635,9 +645,8 @@ function renderFlowchartCommand(
   context.fillText(command.title, 90, 52);
 
   if (command.nodes.length === 0) {
-    context.fillStyle = BOARD_INK;
-    context.font = '38px "Segoe UI", sans-serif';
-    context.fillText("No flowchart nodes were returned.", 90, 180);
+    // During animation the title is written before the first node.
+    // Keep the rest of the board clean instead of showing an error.
     return;
   }
 
@@ -1155,6 +1164,345 @@ function renderBoardCommandToCanvas(
   context.restore();
 }
 
+
+function clampAnimationSpeed(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 55;
+  }
+
+  return Math.min(100, Math.max(10, value));
+}
+
+function writingDelayMs(speed: number): number {
+  const normalized = (clampAnimationSpeed(speed) - 10) / 90;
+  return 92 - normalized * 84;
+}
+
+function drawingUnitMs(speed: number): number {
+  const normalized = (clampAnimationSpeed(speed) - 10) / 90;
+  return 720 - normalized * 610;
+}
+
+function characterLength(value: string): number {
+  return Array.from(value).length;
+}
+
+function takeCharacterPrefix(
+  value: string,
+  count: number,
+): string {
+  return Array.from(value)
+    .slice(0, Math.max(0, count))
+    .join("");
+}
+
+function countTextCommandCharacters(
+  command: BoardTextCommand,
+): number {
+  return (
+    characterLength(command.title) +
+    command.bullets.reduce(
+      (sum, item) => sum + characterLength(item),
+      0,
+    ) +
+    (command.formulas ?? []).reduce(
+      (sum, item) => sum + characterLength(item),
+      0,
+    ) +
+    (command.note ? characterLength(command.note) : 0)
+  );
+}
+
+function buildPartialTextCommand(
+  command: BoardTextCommand,
+  visibleCharacters: number,
+): BoardTextCommand {
+  let remaining = Math.max(0, visibleCharacters);
+
+  const take = (value: string): string => {
+    if (remaining <= 0) {
+      return "";
+    }
+
+    const length = characterLength(value);
+    const result = takeCharacterPrefix(
+      value,
+      Math.min(length, remaining),
+    );
+
+    remaining -= Math.min(length, remaining);
+    return result;
+  };
+
+  const title = take(command.title);
+  const bullets: string[] = [];
+
+  for (const bullet of command.bullets) {
+    if (remaining <= 0) {
+      break;
+    }
+
+    const partial = take(bullet);
+
+    if (partial) {
+      bullets.push(partial);
+    }
+  }
+
+  const formulas: string[] = [];
+
+  for (const formula of command.formulas ?? []) {
+    if (remaining <= 0) {
+      break;
+    }
+
+    const partial = take(formula);
+
+    if (partial) {
+      formulas.push(partial);
+    }
+  }
+
+  const note =
+    remaining > 0 && command.note
+      ? take(command.note)
+      : undefined;
+
+  return {
+    type: "write_text",
+    title,
+    bullets,
+    ...(formulas.length > 0 ? { formulas } : {}),
+    ...(note ? { note } : {}),
+  };
+}
+
+function buildPartialFlowchartCommand(
+  command: BoardFlowchartCommand,
+  progress: number,
+): BoardFlowchartCommand {
+  const safeProgress = Math.min(1, Math.max(0, progress));
+
+  // Title uses the first 18% of the drawing animation.
+  const titleProgress = Math.min(1, safeProgress / 0.18);
+  const title = takeCharacterPrefix(
+    command.title,
+    Math.ceil(characterLength(command.title) * titleProgress),
+  );
+
+  if (safeProgress <= 0.18) {
+    return {
+      type: "flowchart",
+      title,
+      nodes: [],
+      edges: [],
+    };
+  }
+
+  const contentProgress = (safeProgress - 0.18) / 0.82;
+  const nodeWeight = Math.max(1, command.nodes.length) * 2;
+  const edgeWeight = Math.max(1, command.edges.length);
+  const totalWeight = nodeWeight + edgeWeight;
+  const contentUnits = contentProgress * totalWeight;
+
+  const nodeUnits = Math.min(nodeWeight, contentUnits);
+  const fullNodes = Math.min(
+    command.nodes.length,
+    Math.floor(nodeUnits / 2),
+  );
+
+  const nodes = command.nodes
+    .slice(0, fullNodes)
+    .map((node) => ({ ...node }));
+
+  if (
+    fullNodes < command.nodes.length &&
+    nodeUnits > fullNodes * 2
+  ) {
+    const currentNode = command.nodes[fullNodes];
+    const labelProgress = Math.min(
+      1,
+      nodeUnits - fullNodes * 2,
+    );
+
+    nodes.push({
+      ...currentNode,
+      label: takeCharacterPrefix(
+        currentNode.label,
+        Math.ceil(
+          characterLength(currentNode.label) * labelProgress,
+        ),
+      ),
+    });
+  }
+
+  const edgeUnits = Math.max(0, contentUnits - nodeWeight);
+  const edgeCount = Math.min(
+    command.edges.length,
+    Math.floor(edgeUnits + 0.001),
+  );
+
+  return {
+    type: "flowchart",
+    title,
+    nodes,
+    edges: command.edges.slice(0, edgeCount),
+  };
+}
+
+function buildPartialChartCommand(
+  command: BoardChartCommand,
+  progress: number,
+): BoardChartCommand {
+  const safeProgress = Math.min(1, Math.max(0, progress));
+  const titleProgress = Math.min(1, safeProgress / 0.2);
+  const dataProgress = Math.max(0, (safeProgress - 0.2) / 0.8);
+
+  const title = takeCharacterPrefix(
+    command.title,
+    Math.ceil(characterLength(command.title) * titleProgress),
+  );
+
+  const visibleRows =
+    command.data.length > 0
+      ? Math.max(
+          1,
+          Math.ceil(command.data.length * dataProgress),
+        )
+      : 0;
+
+  return {
+    ...command,
+    title,
+    data: command.data.slice(0, visibleRows),
+  };
+}
+
+function createFittedImageCanvas(
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    return canvas;
+  }
+
+  context.fillStyle = BOARD_BACKGROUND;
+  context.fillRect(0, 0, width, height);
+
+  const scale = Math.min(
+    width / image.naturalWidth,
+    height / image.naturalHeight,
+  );
+
+  const drawWidth = image.naturalWidth * scale;
+  const drawHeight = image.naturalHeight * scale;
+  const x = (width - drawWidth) / 2;
+  const y = (height - drawHeight) / 2;
+
+  context.drawImage(
+    image,
+    x,
+    y,
+    drawWidth,
+    drawHeight,
+  );
+
+  return canvas;
+}
+
+function paintImageDoodleReveal(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  sourceCanvas: HTMLCanvasElement,
+  progress: number,
+) {
+  const safeProgress = Math.min(1, Math.max(0, progress));
+
+  context.save();
+  context.globalCompositeOperation = "source-over";
+  context.fillStyle = BOARD_BACKGROUND;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  const bandHeight = 24;
+  const bandCount = Math.ceil(canvas.height / bandHeight);
+  const scaled = safeProgress * bandCount;
+  const completedBands = Math.floor(scaled);
+  const currentBandProgress = scaled - completedBands;
+
+  for (let band = 0; band < completedBands; band += 1) {
+    const y = band * bandHeight;
+    const height = Math.min(
+      bandHeight + 2,
+      canvas.height - y,
+    );
+
+    context.drawImage(
+      sourceCanvas,
+      0,
+      y,
+      canvas.width,
+      height,
+      0,
+      y,
+      canvas.width,
+      height,
+    );
+  }
+
+  if (
+    completedBands < bandCount &&
+    currentBandProgress > 0
+  ) {
+    const y = completedBands * bandHeight;
+    const height = Math.min(
+      bandHeight + 2,
+      canvas.height - y,
+    );
+    const revealWidth = Math.max(
+      1,
+      Math.floor(canvas.width * currentBandProgress),
+    );
+
+    // Alternate marker direction on each pass. This looks less like a
+    // loading wipe and more like a hand moving back and forth.
+    if (completedBands % 2 === 0) {
+      context.drawImage(
+        sourceCanvas,
+        0,
+        y,
+        revealWidth,
+        height,
+        0,
+        y,
+        revealWidth,
+        height,
+      );
+    } else {
+      const x = canvas.width - revealWidth;
+      context.drawImage(
+        sourceCanvas,
+        x,
+        y,
+        revealWidth,
+        height,
+        x,
+        y,
+        revealWidth,
+        height,
+      );
+    }
+  }
+
+  context.restore();
+}
+
 function loadBoardImage(
   command: BoardImageCommand,
 ): Promise<HTMLImageElement> {
@@ -1218,7 +1566,11 @@ export default function PresentationBoard({
   savedDrawing,
   generatedCommand,
   generatedCommandVersion,
+  writingSpeed,
+  drawingSpeed,
+  animationPaused = false,
   onDrawingChange,
+  onCommandRenderComplete,
 }: PresentationBoardProps) {
   const isDrawingRef = useRef(false);
 
@@ -1239,6 +1591,21 @@ export default function PresentationBoard({
 
   const drawingLoadRunRef = useRef(0);
   const commandRenderRunRef = useRef(0);
+  const animationPausedRef = useRef(animationPaused);
+  const writingSpeedRef = useRef(writingSpeed);
+  const drawingSpeedRef = useRef(drawingSpeed);
+
+  useEffect(() => {
+    animationPausedRef.current = animationPaused;
+  }, [animationPaused]);
+
+  useEffect(() => {
+    writingSpeedRef.current = writingSpeed;
+  }, [writingSpeed]);
+
+  useEffect(() => {
+    drawingSpeedRef.current = drawingSpeed;
+  }, [drawingSpeed]);
 
   const drawingCanvas = useMemo(() => {
     if (typeof document === "undefined") {
@@ -1356,29 +1723,176 @@ export default function PresentationBoard({
       command: BoardCommand,
       targetBoardId: number,
       renderRun: number,
+      commandVersion: number,
     ) => {
       if (!drawingCanvas || !context) {
         return;
       }
 
-      // Do not paint a result onto a different board if the user
-      // switched boards while Gemini was answering.
-      if (
+      const isCancelled = () =>
         renderRun !== commandRenderRunRef.current ||
-        activeBoardIdRef.current !== targetBoardId
-      ) {
-        return;
-      }
+        activeBoardIdRef.current !== targetBoardId;
+
+      const animate = async (
+        durationMs: number,
+        drawFrame: (progress: number) => void,
+      ): Promise<boolean> => {
+        return new Promise((resolve) => {
+          let accumulated = 0;
+          let lastTimestamp: number | null = null;
+
+          const frame = (timestamp: number) => {
+            if (isCancelled()) {
+              resolve(false);
+              return;
+            }
+
+            if (lastTimestamp === null) {
+              lastTimestamp = timestamp;
+            }
+
+            const delta = Math.min(50, timestamp - lastTimestamp);
+            lastTimestamp = timestamp;
+
+            // Pausing voice also pauses the board-writing clock.
+            if (!animationPausedRef.current) {
+              accumulated += delta;
+            }
+
+            const progress = Math.min(
+              1,
+              accumulated / Math.max(1, durationMs),
+            );
+
+            drawFrame(progress);
+            refreshTexture();
+
+            if (progress >= 1) {
+              resolve(true);
+              return;
+            }
+
+            window.requestAnimationFrame(frame);
+          };
+
+          window.requestAnimationFrame(frame);
+        });
+      };
+
+      let completed = false;
 
       if (command.type === "image") {
         const image = await loadBoardImage(command);
 
-        // Image decoding is asynchronous. Check again after it finishes
-        // so an old result cannot paint onto a newly selected board.
-        if (
-          renderRun !== commandRenderRunRef.current ||
-          activeBoardIdRef.current !== targetBoardId
-        ) {
+        if (isCancelled()) {
+          return;
+        }
+
+        const fittedImage = createFittedImageCanvas(
+          image,
+          drawingCanvas.width,
+          drawingCanvas.height,
+        );
+
+        const duration =
+          900 + drawingUnitMs(drawingSpeedRef.current) * 8;
+
+        completed = await animate(
+          duration,
+          (progress) => {
+            paintImageDoodleReveal(
+              context,
+              drawingCanvas,
+              fittedImage,
+              progress,
+            );
+          },
+        );
+      } else if (command.type === "write_text") {
+        const characterCount = Math.max(
+          1,
+          countTextCommandCharacters(command),
+        );
+
+        const duration = Math.min(
+          30000,
+          Math.max(450, characterCount * writingDelayMs(writingSpeedRef.current)),
+        );
+
+        completed = await animate(
+          duration,
+          (progress) => {
+            const visibleCharacters = Math.ceil(
+              characterCount * progress,
+            );
+
+            renderBoardCommandToCanvas(
+              context,
+              drawingCanvas,
+              buildPartialTextCommand(
+                command,
+                visibleCharacters,
+              ),
+            );
+          },
+        );
+      } else if (command.type === "flowchart") {
+        const complexity =
+          Math.max(1, command.nodes.length) * 1.25 +
+          Math.max(1, command.edges.length) * 0.8;
+
+        const duration = Math.min(
+          24000,
+          1000 + drawingUnitMs(drawingSpeedRef.current) * complexity,
+        );
+
+        completed = await animate(
+          duration,
+          (progress) => {
+            renderBoardCommandToCanvas(
+              context,
+              drawingCanvas,
+              buildPartialFlowchartCommand(
+                command,
+                progress,
+              ),
+            );
+          },
+        );
+      } else {
+        const dataCount = Math.max(1, command.data.length);
+        const duration = Math.min(
+          18000,
+          1100 +
+            drawingUnitMs(drawingSpeedRef.current) *
+              Math.min(12, dataCount) *
+              0.7,
+        );
+
+        completed = await animate(
+          duration,
+          (progress) => {
+            renderBoardCommandToCanvas(
+              context,
+              drawingCanvas,
+              buildPartialChartCommand(
+                command,
+                progress,
+              ),
+            );
+          },
+        );
+      }
+
+      if (!completed || isCancelled()) {
+        return;
+      }
+
+      // Ensure the exact final scene is painted after the animation.
+      if (command.type === "image") {
+        const image = await loadBoardImage(command);
+
+        if (isCancelled()) {
           return;
         }
 
@@ -1404,12 +1918,18 @@ export default function PresentationBoard({
         targetBoardId,
         finishedDrawing,
       );
+
+      onCommandRenderComplete?.(
+        targetBoardId,
+        commandVersion,
+      );
     },
     [
       drawingCanvas,
       context,
       refreshTexture,
       onDrawingChange,
+      onCommandRenderComplete,
     ],
   );
 
@@ -1598,6 +2118,7 @@ export default function PresentationBoard({
       generatedCommand,
       boardId,
       renderRun,
+      generatedCommandVersion,
     ).catch((error) => {
       console.error(
         "Could not render whiteboard command:",
@@ -1617,6 +2138,13 @@ export default function PresentationBoard({
     return () => {
       if (commandRenderRunRef.current === renderRun) {
         commandRenderRunRef.current += 1;
+
+        if (
+          completedCommandRenderRef.current[boardId] ===
+          generatedCommandVersion
+        ) {
+          delete completedCommandRenderRef.current[boardId];
+        }
       }
     };
   }, [

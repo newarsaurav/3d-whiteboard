@@ -276,6 +276,13 @@ export default function LixiaStudio() {
 
   const teachingRunRef = useRef(0);
 
+  const boardVersionRef =
+    useRef<Record<number, number>>({ 1: 0 });
+
+  const boardRenderWaitersRef = useRef(
+    new Map<string, () => void>(),
+  );
+
   const teacherAudioContextRef =
     useRef<AudioContext | null>(null);
 
@@ -302,6 +309,13 @@ export default function LixiaStudio() {
 
   const [lineWidth, setLineWidth] =
     useState(8);
+
+  // 10 = slow and deliberate, 100 = very fast.
+  const [writingSpeed, setWritingSpeed] =
+    useState(55);
+
+  const [drawingSpeed, setDrawingSpeed] =
+    useState(55);
 
   const [clearSignal, setClearSignal] =
     useState(0);
@@ -731,6 +745,53 @@ export default function LixiaStudio() {
     }
   }
 
+
+  const handleBoardRenderComplete = useCallback(
+    (boardId: number, version: number) => {
+      const key = `${boardId}:${version}`;
+      const resolve = boardRenderWaitersRef.current.get(key);
+
+      if (resolve) {
+        boardRenderWaitersRef.current.delete(key);
+        resolve();
+      }
+    },
+    [],
+  );
+
+  function waitForBoardRender(
+    boardId: number,
+    version: number,
+    runId: number,
+  ): Promise<void> {
+    return new Promise((resolve) => {
+      const key = `${boardId}:${version}`;
+      let settled = false;
+
+      const finish = () => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+        boardRenderWaitersRef.current.delete(key);
+        resolve();
+      };
+
+      boardRenderWaitersRef.current.set(key, finish);
+
+      // Safety timeout only. Normal completion comes from PresentationBoard.
+      window.setTimeout(() => {
+        if (runId !== teachingRunRef.current) {
+          finish();
+          return;
+        }
+
+        finish();
+      }, 45000);
+    });
+  }
+
   async function runTeacherLesson(
     boardId: number,
     lesson: TeacherLessonCommand,
@@ -758,32 +819,39 @@ export default function LixiaStudio() {
           return;
         }
 
+        const nextVersion =
+          (boardVersionRef.current[boardId] ?? 0) + 1;
+
+        boardVersionRef.current[boardId] = nextVersion;
+
+        const boardFinished = waitForBoardRender(
+          boardId,
+          nextVersion,
+          runId,
+        );
+
         setBoards((currentBoards) =>
           currentBoards.map((board) =>
             board.id === boardId
               ? {
                   ...board,
                   generatedCommand: segment.board,
-                  generatedCommandVersion:
-                    board.generatedCommandVersion + 1,
+                  generatedCommandVersion: nextVersion,
                 }
               : board,
           ),
         );
 
-        await new Promise<void>((resolve) => {
-          window.setTimeout(resolve, 180);
-        });
-
-        if (runId !== teachingRunRef.current) {
-          return;
-        }
-
-        await speakTeachingSegment(
-          segment.narration,
-          lesson.language ?? "en-US",
-          runId,
-        );
+        // Start speaking while Lixia writes, like a real teacher.
+        // Do not advance to the next segment until BOTH have finished.
+        await Promise.all([
+          boardFinished,
+          speakTeachingSegment(
+            segment.narration,
+            lesson.language ?? "en-US",
+            runId,
+          ),
+        ]);
       }
     } finally {
       if (runId === teachingRunRef.current) {
@@ -869,6 +937,7 @@ export default function LixiaStudio() {
       newBoard,
     ]);
 
+    boardVersionRef.current[nextId] = 0;
     setActiveBoardId(nextId);
   }
 
@@ -1076,14 +1145,19 @@ export default function LixiaStudio() {
       }
 
       // command is now narrowed to BoardCommand.
+      const nextVersion =
+        (boardVersionRef.current[targetBoardId] ??
+          targetBoard.generatedCommandVersion) + 1;
+
+      boardVersionRef.current[targetBoardId] = nextVersion;
+
       setBoards((currentBoards) =>
         currentBoards.map((board) =>
           board.id === targetBoardId
             ? {
                 ...board,
                 generatedCommand: command,
-                generatedCommandVersion:
-                  board.generatedCommandVersion + 1,
+                generatedCommandVersion: nextVersion,
               }
             : board,
         ),
@@ -1263,6 +1337,62 @@ export default function LixiaStudio() {
             </div>
           </div>
 
+          <div
+            style={{
+              display: "grid",
+              gap: 6,
+              margin: "10px 0 4px",
+              padding: "9px 10px",
+              borderRadius: 12,
+              background: "rgba(255,255,255,0.06)",
+              fontSize: 12,
+            }}
+          >
+            <label
+              style={{
+                display: "grid",
+                gridTemplateColumns: "72px 1fr 34px",
+                gap: 8,
+                alignItems: "center",
+              }}
+            >
+              <span>Writing</span>
+              <input
+                type="range"
+                min="10"
+                max="100"
+                value={writingSpeed}
+                title="Lixia writing speed"
+                onChange={(event) =>
+                  setWritingSpeed(Number(event.target.value))
+                }
+              />
+              <strong>{writingSpeed}</strong>
+            </label>
+
+            <label
+              style={{
+                display: "grid",
+                gridTemplateColumns: "72px 1fr 34px",
+                gap: 8,
+                alignItems: "center",
+              }}
+            >
+              <span>Drawing</span>
+              <input
+                type="range"
+                min="10"
+                max="100"
+                value={drawingSpeed}
+                title="Lixia drawing speed"
+                onChange={(event) =>
+                  setDrawingSpeed(Number(event.target.value))
+                }
+              />
+              <strong>{drawingSpeed}</strong>
+            </label>
+          </div>
+
           {assistantError && (
             <p className="assistant-error">
               {assistantError}
@@ -1402,7 +1532,13 @@ export default function LixiaStudio() {
             generatedCommandVersion={
               activeBoard.generatedCommandVersion
             }
+            writingSpeed={writingSpeed}
+            drawingSpeed={drawingSpeed}
+            animationPaused={isTeachingPaused}
             onDrawingChange={updateBoardDrawing}
+            onCommandRenderComplete={
+              handleBoardRenderComplete
+            }
           />
 
           <Environment preset="city" />
