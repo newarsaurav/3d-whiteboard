@@ -75,6 +75,10 @@ export interface BoardImageCommand {
   // Base64 data URL returned by Gemini Image.
   imageDataUrl: string;
 
+  // Doodle images are traced locally into actual marker strokes.
+  // Realistic images stay as raster images.
+  style?: "doodle" | "realistic";
+
   // Helps the router understand whether this came from a new image
   // request or an edit of the existing board image.
   mode: "create" | "edit";

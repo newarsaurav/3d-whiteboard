@@ -1,5 +1,5 @@
-- Gemini should be able to hold the previous conversation as well
 - Drawing should be like handwriting
+- Gemini should be able to hold the previous conversation as well
 - should bew able ti watch the board and tell what has been written
 - the board is cleared only if the next response or question is not related to each other
 - if related the board should not be cleared
