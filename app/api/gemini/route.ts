@@ -141,6 +141,36 @@ const teachLessonDeclaration: FunctionDeclaration = {
               description:
                 "Optional worked example, key takeaway, or short teacher note visible on the board.",
             },
+            gesture: {
+              type: "string",
+              enum: [
+                "continue",
+                "wave",
+                "goodbye",
+                "talk",
+                "point",
+                "think",
+                "agree",
+                "disagree",
+                "explain",
+                "emphasize",
+                "thanks",
+                "welcome",
+                "offer",
+                "uncertain",
+                "idea",
+                "approve",
+                "next",
+                "listen",
+                "confused",
+                "ready",
+                "reveal",
+                "contrast",
+                "together",
+              ],
+              description:
+                "Body gesture Mike performs while speaking this segment. Pick the one matching the narration's intent: 'welcome' or 'ready' to open a lesson, 'explain' for how something works, 'emphasize' for key points, 'point' when directing attention to the board, 'reveal' for results, 'contrast' for however/alternatives, 'next' when moving to a new part, 'approve' for praise, 'goodbye' to close. Use 'continue' when no distinct gesture fits.",
+            },
           },
           required: ["narration", "boardTitle", "boardBullets"],
         },
@@ -414,8 +444,12 @@ function buildTeacherLessonCommand(
 
       const note = readString(segment.note, "", 220);
 
+      const gesture = readString(segment.gesture, "", 24)
+        .toLowerCase();
+
       return {
         narration,
+        ...(gesture ? { gesture } : {}),
         board: {
           type: "write_text" as const,
           title: readString(
@@ -892,10 +926,10 @@ Rules:
     ],
     config: {
       responseModalities: ["IMAGE"],
-      responseFormat: {
-        image: {
-          aspectRatio: "16:9",
-        },
+      // `responseFormat` is not part of GenerateContentConfig in
+      // @google/genai; aspect ratio goes through imageConfig.
+      imageConfig: {
+        aspectRatio: "16:9",
       },
     },
   });
@@ -1040,6 +1074,7 @@ BOARD CONTEXT:
 - Keep teach_lesson narration conversational and more detailed than the board. The board is the concise visual summary; narration is the fuller explanation.
 - For formulas, put symbolic notation on the board, but phrase the narration naturally. Example: board shows "a = Δv / Δt" while narration says "acceleration equals change in velocity divided by change in time."
 - Prefer 3-5 lesson segments so the learner sees the board develop step by step.
+- For teach_lesson, give every segment a gesture that matches its narration. Vary the gestures across the lesson: typically open with welcome/ready, use explain/point/emphasize in the middle, and end with approve/goodbye. Do not repeat the same gesture in consecutive segments unless it clearly fits.
 
 Current structured board content:
 ${currentCommand}

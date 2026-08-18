@@ -28,6 +28,12 @@ export interface BoardTextCommand {
 export interface TeacherLessonSegment {
   narration: string;
   board: BoardTextCommand;
+
+  // Presentation gesture intent Mike performs while this segment is
+  // narrated (from the @lixia/mike-animation gesture vocabulary,
+  // e.g. "explain", "emphasize", "point"). Optional — the studio
+  // falls back to a rotation of teaching gestures when absent.
+  gesture?: string;
 }
 
 export interface TeacherLessonCommand {
