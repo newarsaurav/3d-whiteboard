@@ -36,9 +36,19 @@ interface PresentationBoardProps {
   generatedCommand: BoardCommand | null;
   generatedCommandVersion: number;
 
+  // 10 = slow, 100 = fast.
+  writingSpeed: number;
+  drawingSpeed: number;
+  animationPaused?: boolean;
+
   onDrawingChange: (
     boardId: number,
     drawing: string,
+  ) => void;
+
+  onCommandRenderComplete?: (
+    boardId: number,
+    version: number,
   ) => void;
 
 }
@@ -560,6 +570,76 @@ function drawArrow(
   context.restore();
 }
 
+function splitFlowchartWord(
+  context: CanvasRenderingContext2D,
+  word: string,
+  maxWidth: number,
+): string[] {
+  if (context.measureText(word).width <= maxWidth) {
+    return [word];
+  }
+
+  const pieces: string[] = [];
+  let current = "";
+
+  for (const character of Array.from(word)) {
+    const candidate = current + character;
+
+    if (
+      current &&
+      context.measureText(candidate).width > maxWidth
+    ) {
+      pieces.push(current);
+      current = character;
+    } else {
+      current = candidate;
+    }
+  }
+
+  if (current) {
+    pieces.push(current);
+  }
+
+  return pieces;
+}
+
+function getFlowchartLabelLines(
+  context: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+): string[] {
+  const rawWords = text
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter(Boolean);
+
+  const words = rawWords.flatMap((word) =>
+    splitFlowchartWord(context, word, maxWidth),
+  );
+
+  if (words.length === 0) {
+    return [];
+  }
+
+  const lines: string[] = [];
+  let current = words[0];
+
+  for (let index = 1; index < words.length; index += 1) {
+    const candidate = current + " " + words[index];
+
+    if (context.measureText(candidate).width <= maxWidth) {
+      current = candidate;
+    } else {
+      lines.push(current);
+      current = words[index];
+    }
+  }
+
+  lines.push(current);
+  return lines;
+}
+
 function drawFlowchartNode(
   context: CanvasRenderingContext2D,
   node: RenderNode,
@@ -607,18 +687,85 @@ function drawFlowchartNode(
     context.stroke();
   }
 
-  context.fillStyle = BOARD_INK;
-  context.font = '600 29px "Segoe UI", sans-serif';
+  /*
+   * Text must fit inside the usable interior of the shape, not merely
+   * inside its outer bounding box. Diamonds and circles have much less
+   * usable width near their edges, so give them a narrower text area.
+   */
+  const usableWidth =
+    node.shape === "diamond"
+      ? node.width * 0.52
+      : node.shape === "circle"
+        ? node.width * 0.7
+        : node.width - 42;
 
-  drawCenteredWrappedText(
-    context,
-    node.label,
-    node.center.x,
-    node.center.y,
-    node.width - 34,
-    34,
-    node.shape === "diamond" ? 2 : 3,
-  );
+  const usableHeight =
+    node.shape === "diamond"
+      ? node.height * 0.58
+      : node.shape === "circle"
+        ? node.height * 0.68
+        : node.height - 28;
+
+  const maxLines = node.shape === "diamond" ? 3 : 4;
+
+  let fontSize = 30;
+  let lineHeight = 34;
+  let lines: string[] = [];
+
+  while (fontSize >= 17) {
+    context.font =
+      `600 ${fontSize}px "Lixia Handwriting", "Segoe UI", sans-serif`;
+
+    lineHeight = Math.round(fontSize * 1.12);
+    lines = getFlowchartLabelLines(
+      context,
+      node.label,
+      usableWidth,
+    );
+
+    const requiredHeight =
+      Math.max(1, lines.length) * lineHeight;
+
+    if (
+      lines.length <= maxLines &&
+      requiredHeight <= usableHeight
+    ) {
+      break;
+    }
+
+    fontSize -= 2;
+  }
+
+  if (lines.length > maxLines) {
+    lines = lines.slice(0, maxLines);
+
+    const lastIndex = lines.length - 1;
+    let lastLine = lines[lastIndex];
+
+    while (
+      lastLine.length > 1 &&
+      context.measureText(lastLine + "…").width > usableWidth
+    ) {
+      lastLine = lastLine.slice(0, -1);
+    }
+
+    lines[lastIndex] = lastLine.trimEnd() + "…";
+  }
+
+  const totalHeight =
+    Math.max(0, lines.length - 1) * lineHeight;
+
+  context.fillStyle = BOARD_INK;
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+
+  lines.forEach((line, index) => {
+    context.fillText(
+      line,
+      node.center.x,
+      node.center.y - totalHeight / 2 + index * lineHeight,
+    );
+  });
 
   context.restore();
 }
@@ -635,9 +782,8 @@ function renderFlowchartCommand(
   context.fillText(command.title, 90, 52);
 
   if (command.nodes.length === 0) {
-    context.fillStyle = BOARD_INK;
-    context.font = '38px "Segoe UI", sans-serif';
-    context.fillText("No flowchart nodes were returned.", 90, 180);
+    // During animation the title is written before the first node.
+    // Keep the rest of the board clean instead of showing an error.
     return;
   }
 
@@ -1155,6 +1301,1210 @@ function renderBoardCommandToCanvas(
   context.restore();
 }
 
+
+function clampAnimationSpeed(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 55;
+  }
+
+  return Math.min(100, Math.max(10, value));
+}
+
+function writingDelayMs(speed: number): number {
+  const normalized = (clampAnimationSpeed(speed) - 10) / 90;
+  return 92 - normalized * 84;
+}
+
+function drawingUnitMs(speed: number): number {
+  const normalized = (clampAnimationSpeed(speed) - 10) / 90;
+  return 720 - normalized * 610;
+}
+
+function characterLength(value: string): number {
+  return Array.from(value).length;
+}
+
+function takeCharacterPrefix(
+  value: string,
+  count: number,
+): string {
+  return Array.from(value)
+    .slice(0, Math.max(0, count))
+    .join("");
+}
+
+function countTextCommandCharacters(
+  command: BoardTextCommand,
+): number {
+  return (
+    characterLength(command.title) +
+    command.bullets.reduce(
+      (sum, item) => sum + characterLength(item),
+      0,
+    ) +
+    (command.formulas ?? []).reduce(
+      (sum, item) => sum + characterLength(item),
+      0,
+    ) +
+    (command.note ? characterLength(command.note) : 0)
+  );
+}
+
+function buildPartialTextCommand(
+  command: BoardTextCommand,
+  visibleCharacters: number,
+): BoardTextCommand {
+  let remaining = Math.max(0, visibleCharacters);
+
+  const take = (value: string): string => {
+    if (remaining <= 0) {
+      return "";
+    }
+
+    const length = characterLength(value);
+    const result = takeCharacterPrefix(
+      value,
+      Math.min(length, remaining),
+    );
+
+    remaining -= Math.min(length, remaining);
+    return result;
+  };
+
+  const title = take(command.title);
+  const bullets: string[] = [];
+
+  for (const bullet of command.bullets) {
+    if (remaining <= 0) {
+      break;
+    }
+
+    const partial = take(bullet);
+
+    if (partial) {
+      bullets.push(partial);
+    }
+  }
+
+  const formulas: string[] = [];
+
+  for (const formula of command.formulas ?? []) {
+    if (remaining <= 0) {
+      break;
+    }
+
+    const partial = take(formula);
+
+    if (partial) {
+      formulas.push(partial);
+    }
+  }
+
+  const note =
+    remaining > 0 && command.note
+      ? take(command.note)
+      : undefined;
+
+  return {
+    type: "write_text",
+    title,
+    bullets,
+    ...(formulas.length > 0 ? { formulas } : {}),
+    ...(note ? { note } : {}),
+  };
+}
+
+function buildPartialFlowchartCommand(
+  command: BoardFlowchartCommand,
+  progress: number,
+): BoardFlowchartCommand {
+  const safeProgress = Math.min(1, Math.max(0, progress));
+
+  // Title uses the first 18% of the drawing animation.
+  const titleProgress = Math.min(1, safeProgress / 0.18);
+  const title = takeCharacterPrefix(
+    command.title,
+    Math.ceil(characterLength(command.title) * titleProgress),
+  );
+
+  if (safeProgress <= 0.18) {
+    return {
+      type: "flowchart",
+      title,
+      nodes: [],
+      edges: [],
+    };
+  }
+
+  const contentProgress = (safeProgress - 0.18) / 0.82;
+  const nodeWeight = Math.max(1, command.nodes.length) * 2;
+  const edgeWeight = Math.max(1, command.edges.length);
+  const totalWeight = nodeWeight + edgeWeight;
+  const contentUnits = contentProgress * totalWeight;
+
+  const nodeUnits = Math.min(nodeWeight, contentUnits);
+  const fullNodes = Math.min(
+    command.nodes.length,
+    Math.floor(nodeUnits / 2),
+  );
+
+  const nodes = command.nodes
+    .slice(0, fullNodes)
+    .map((node) => ({ ...node }));
+
+  if (
+    fullNodes < command.nodes.length &&
+    nodeUnits > fullNodes * 2
+  ) {
+    const currentNode = command.nodes[fullNodes];
+    const labelProgress = Math.min(
+      1,
+      nodeUnits - fullNodes * 2,
+    );
+
+    nodes.push({
+      ...currentNode,
+      label: takeCharacterPrefix(
+        currentNode.label,
+        Math.ceil(
+          characterLength(currentNode.label) * labelProgress,
+        ),
+      ),
+    });
+  }
+
+  const edgeUnits = Math.max(0, contentUnits - nodeWeight);
+  const edgeCount = Math.min(
+    command.edges.length,
+    Math.floor(edgeUnits + 0.001),
+  );
+
+  return {
+    type: "flowchart",
+    title,
+    nodes,
+    edges: command.edges.slice(0, edgeCount),
+  };
+}
+
+function buildPartialChartCommand(
+  command: BoardChartCommand,
+  progress: number,
+): BoardChartCommand {
+  const safeProgress = Math.min(1, Math.max(0, progress));
+  const titleProgress = Math.min(1, safeProgress / 0.2);
+  const dataProgress = Math.max(0, (safeProgress - 0.2) / 0.8);
+
+  const title = takeCharacterPrefix(
+    command.title,
+    Math.ceil(characterLength(command.title) * titleProgress),
+  );
+
+  const visibleRows =
+    command.data.length > 0
+      ? Math.max(
+          1,
+          Math.ceil(command.data.length * dataProgress),
+        )
+      : 0;
+
+  return {
+    ...command,
+    title,
+    data: command.data.slice(0, visibleRows),
+  };
+}
+
+function createFittedImageCanvas(
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d");
+
+  if (!context) {
+    return canvas;
+  }
+
+  context.fillStyle = BOARD_BACKGROUND;
+  context.fillRect(0, 0, width, height);
+
+  const scale = Math.min(
+    width / image.naturalWidth,
+    height / image.naturalHeight,
+  );
+
+  const drawWidth = image.naturalWidth * scale;
+  const drawHeight = image.naturalHeight * scale;
+  const x = (width - drawWidth) / 2;
+  const y = (height - drawHeight) / 2;
+
+  context.drawImage(
+    image,
+    x,
+    y,
+    drawWidth,
+    drawHeight,
+  );
+
+  return canvas;
+}
+
+function deterministicStrokeJitter(seed: number): number {
+  const value = Math.sin(seed * 12.9898 + 78.233) * 43758.5453;
+  return (value - Math.floor(value)) * 2 - 1;
+}
+
+type DoodleRevealPoint = {
+  x: number;
+  y: number;
+  breakBefore: boolean;
+};
+
+type DoodleRevealPlan = {
+  points: DoodleRevealPoint[];
+  maskCanvas: HTMLCanvasElement;
+  maskContext: CanvasRenderingContext2D | null;
+  revealCanvas: HTMLCanvasElement;
+  revealContext: CanvasRenderingContext2D | null;
+  revealedCount: number;
+};
+
+function isInkPixel(
+  red: number,
+  green: number,
+  blue: number,
+  alpha: number,
+): boolean {
+  if (alpha < 24) {
+    return false;
+  }
+
+  /*
+   * Doodle images are generated on an almost-white background.
+   * Detect actual marker/colored pixels instead of scanning the whole
+   * rectangle. This is what prevents the old left-to-right wipe.
+   */
+  const darkest = Math.min(red, green, blue);
+  const lightest = Math.max(red, green, blue);
+  const saturation = lightest - darkest;
+  const distanceFromWhite =
+    (255 - red) + (255 - green) + (255 - blue);
+
+  return (
+    darkest < 232 ||
+    saturation > 24 ||
+    distanceFromWhite > 55
+  );
+}
+
+function buildDoodleRevealPlan(
+  sourceCanvas: HTMLCanvasElement,
+): DoodleRevealPlan {
+  const width = sourceCanvas.width;
+  const height = sourceCanvas.height;
+
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = width;
+  maskCanvas.height = height;
+
+  const revealCanvas = document.createElement("canvas");
+  revealCanvas.width = width;
+  revealCanvas.height = height;
+
+  const maskContext = maskCanvas.getContext("2d");
+  const revealContext = revealCanvas.getContext("2d");
+  const sourceContext = sourceCanvas.getContext("2d");
+
+  if (!sourceContext) {
+    return {
+      points: [],
+      maskCanvas,
+      maskContext,
+      revealCanvas,
+      revealContext,
+      revealedCount: 0,
+    };
+  }
+
+  const imageData = sourceContext.getImageData(
+    0,
+    0,
+    width,
+    height,
+  );
+
+  /*
+   * Each occupied grid cell represents a small piece of visible ink.
+   * We later walk connected cells, which makes the reveal follow the
+   * cat/dog outline rather than sweeping horizontally across the board.
+   */
+  const cellSize = 16;
+  const sampleStep = 4;
+  const columns = Math.ceil(width / cellSize);
+  const rows = Math.ceil(height / cellSize);
+  const occupied = new Uint8Array(columns * rows);
+  const hitCounts = new Uint8Array(columns * rows);
+
+  for (let y = 0; y < height; y += sampleStep) {
+    for (let x = 0; x < width; x += sampleStep) {
+      const pixelIndex = (y * width + x) * 4;
+
+      if (
+        !isInkPixel(
+          imageData.data[pixelIndex],
+          imageData.data[pixelIndex + 1],
+          imageData.data[pixelIndex + 2],
+          imageData.data[pixelIndex + 3],
+        )
+      ) {
+        continue;
+      }
+
+      const column = Math.floor(x / cellSize);
+      const row = Math.floor(y / cellSize);
+      const gridIndex = row * columns + column;
+
+      hitCounts[gridIndex] = Math.min(
+        255,
+        hitCounts[gridIndex] + 1,
+      );
+    }
+  }
+
+  for (let index = 0; index < hitCounts.length; index += 1) {
+    if (hitCounts[index] > 0) {
+      occupied[index] = 1;
+    }
+  }
+
+  const neighborOffsets = [
+    [-1, -1],
+    [0, -1],
+    [1, -1],
+    [-1, 0],
+    [1, 0],
+    [-1, 1],
+    [0, 1],
+    [1, 1],
+  ] as const;
+
+  function neighborsOf(index: number): number[] {
+    const row = Math.floor(index / columns);
+    const column = index % columns;
+    const result: number[] = [];
+
+    for (const [dx, dy] of neighborOffsets) {
+      const nextColumn = column + dx;
+      const nextRow = row + dy;
+
+      if (
+        nextColumn < 0 ||
+        nextColumn >= columns ||
+        nextRow < 0 ||
+        nextRow >= rows
+      ) {
+        continue;
+      }
+
+      const nextIndex = nextRow * columns + nextColumn;
+
+      if (occupied[nextIndex]) {
+        result.push(nextIndex);
+      }
+    }
+
+    return result;
+  }
+
+  /*
+   * First collect connected components. The largest component is
+   * usually the main animal outline, so it is drawn before tiny details.
+   */
+  const componentVisited = new Uint8Array(occupied.length);
+  const components: number[][] = [];
+
+  for (let index = 0; index < occupied.length; index += 1) {
+    if (!occupied[index] || componentVisited[index]) {
+      continue;
+    }
+
+    const component: number[] = [];
+    const queue = [index];
+    componentVisited[index] = 1;
+
+    while (queue.length > 0) {
+      const current = queue.pop();
+
+      if (current === undefined) {
+        break;
+      }
+
+      component.push(current);
+
+      for (const neighbor of neighborsOf(current)) {
+        if (!componentVisited[neighbor]) {
+          componentVisited[neighbor] = 1;
+          queue.push(neighbor);
+        }
+      }
+    }
+
+    components.push(component);
+  }
+
+  components.sort((a, b) => b.length - a.length);
+
+  const points: DoodleRevealPoint[] = [];
+  const walkVisited = new Uint8Array(occupied.length);
+
+  for (let componentIndex = 0; componentIndex < components.length; componentIndex += 1) {
+    const component = components[componentIndex];
+
+    if (component.length === 0) {
+      continue;
+    }
+
+    /*
+     * Prefer an endpoint (fewest neighbours) as the place where the
+     * marker first touches this connected stroke.
+     */
+    let startIndex = component[0];
+    let smallestNeighborCount = Number.POSITIVE_INFINITY;
+
+    for (const candidate of component) {
+      const count = neighborsOf(candidate).length;
+      const jitter = deterministicStrokeJitter(candidate + componentIndex * 97);
+
+      if (
+        count < smallestNeighborCount ||
+        (count === smallestNeighborCount && jitter > 0.35)
+      ) {
+        startIndex = candidate;
+        smallestNeighborCount = count;
+      }
+    }
+
+    const stack = [startIndex];
+    let previousGridIndex: number | null = null;
+
+    while (stack.length > 0) {
+      const current = stack.pop();
+
+      if (current === undefined || walkVisited[current]) {
+        continue;
+      }
+
+      walkVisited[current] = 1;
+
+      const row = Math.floor(current / columns);
+      const column = current % columns;
+      const centerX = Math.min(
+        width - 1,
+        column * cellSize + cellSize / 2,
+      );
+      const centerY = Math.min(
+        height - 1,
+        row * cellSize + cellSize / 2,
+      );
+
+      let breakBefore = previousGridIndex === null;
+
+      if (previousGridIndex !== null) {
+        const previousRow = Math.floor(previousGridIndex / columns);
+        const previousColumn = previousGridIndex % columns;
+        const columnDistance = Math.abs(previousColumn - column);
+        const rowDistance = Math.abs(previousRow - row);
+
+        /*
+         * DFS sometimes returns from a branch to another branch. Treat
+         * that as lifting the marker and touching down somewhere else,
+         * rather than drawing an artificial connecting line.
+         */
+        breakBefore =
+          columnDistance > 1 ||
+          rowDistance > 1;
+      }
+
+      points.push({
+        x:
+          centerX +
+          deterministicStrokeJitter(current + 301) * 2.4,
+        y:
+          centerY +
+          deterministicStrokeJitter(current + 607) * 2.4,
+        breakBefore,
+      });
+
+      previousGridIndex = current;
+
+      const candidates = neighborsOf(current)
+        .filter((neighbor) => !walkVisited[neighbor])
+        .sort((a, b) => {
+          /*
+           * Deterministic non-raster ordering avoids a hidden left-to-
+           * right bias while still producing stable animation each run.
+           */
+          const scoreA = deterministicStrokeJitter(
+            a * 31 + current * 7 + componentIndex * 101,
+          );
+          const scoreB = deterministicStrokeJitter(
+            b * 31 + current * 7 + componentIndex * 101,
+          );
+
+          return scoreA - scoreB;
+        });
+
+      for (let i = candidates.length - 1; i >= 0; i -= 1) {
+        stack.push(candidates[i]);
+      }
+    }
+
+    /* Make the next disconnected component start with a marker lift. */
+    previousGridIndex = null;
+  }
+
+  return {
+    points,
+    maskCanvas,
+    maskContext,
+    revealCanvas,
+    revealContext,
+    revealedCount: 0,
+  };
+}
+
+function resetDoodleRevealPlan(plan: DoodleRevealPlan) {
+  plan.revealedCount = 0;
+
+  plan.maskContext?.clearRect(
+    0,
+    0,
+    plan.maskCanvas.width,
+    plan.maskCanvas.height,
+  );
+
+  plan.revealContext?.clearRect(
+    0,
+    0,
+    plan.revealCanvas.width,
+    plan.revealCanvas.height,
+  );
+}
+
+type TracedStroke = {
+  points: RenderPoint[];
+};
+
+function thinBinaryImage(
+  pixels: Uint8Array,
+  width: number,
+  height: number,
+): Uint8Array {
+  const data = pixels.slice();
+  const neighbors = new Array<number>(8);
+
+  const at = (x: number, y: number) => data[y * width + x];
+
+  for (let iteration = 0; iteration < 40; iteration += 1) {
+    let changed = false;
+
+    for (let pass = 0; pass < 2; pass += 1) {
+      const remove: number[] = [];
+
+      for (let y = 1; y < height - 1; y += 1) {
+        for (let x = 1; x < width - 1; x += 1) {
+          const index = y * width + x;
+
+          if (!data[index]) {
+            continue;
+          }
+
+          neighbors[0] = at(x, y - 1);
+          neighbors[1] = at(x + 1, y - 1);
+          neighbors[2] = at(x + 1, y);
+          neighbors[3] = at(x + 1, y + 1);
+          neighbors[4] = at(x, y + 1);
+          neighbors[5] = at(x - 1, y + 1);
+          neighbors[6] = at(x - 1, y);
+          neighbors[7] = at(x - 1, y - 1);
+
+          const count = neighbors.reduce((sum, value) => sum + value, 0);
+
+          if (count < 2 || count > 6) {
+            continue;
+          }
+
+          let transitions = 0;
+
+          for (let i = 0; i < 8; i += 1) {
+            if (neighbors[i] === 0 && neighbors[(i + 1) % 8] === 1) {
+              transitions += 1;
+            }
+          }
+
+          if (transitions !== 1) {
+            continue;
+          }
+
+          const p2 = neighbors[0];
+          const p4 = neighbors[2];
+          const p6 = neighbors[4];
+          const p8 = neighbors[6];
+
+          const firstCondition =
+            pass === 0
+              ? p2 * p4 * p6 === 0 && p4 * p6 * p8 === 0
+              : p2 * p4 * p8 === 0 && p2 * p6 * p8 === 0;
+
+          if (firstCondition) {
+            remove.push(index);
+          }
+        }
+      }
+
+      if (remove.length > 0) {
+        changed = true;
+
+        for (const index of remove) {
+          data[index] = 0;
+        }
+      }
+    }
+
+    if (!changed) {
+      break;
+    }
+  }
+
+  return data;
+}
+
+function simplifyTracePoints(
+  points: RenderPoint[],
+  minimumDistance = 5,
+): RenderPoint[] {
+  if (points.length <= 2) {
+    return points;
+  }
+
+  const simplified: RenderPoint[] = [points[0]];
+  let previous = points[0];
+
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const point = points[index];
+    const distance = Math.hypot(
+      point.x - previous.x,
+      point.y - previous.y,
+    );
+
+    if (distance >= minimumDistance) {
+      simplified.push(point);
+      previous = point;
+    }
+  }
+
+  simplified.push(points[points.length - 1]);
+  return simplified;
+}
+
+function traceDoodleImageToStrokes(
+  sourceCanvas: HTMLCanvasElement,
+): TracedStroke[] {
+  const traceWidth = 320;
+  const traceHeight = 180;
+  const traceCanvas = document.createElement("canvas");
+  traceCanvas.width = traceWidth;
+  traceCanvas.height = traceHeight;
+
+  const traceContext = traceCanvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+
+  if (!traceContext) {
+    return [];
+  }
+
+  traceContext.fillStyle = BOARD_BACKGROUND;
+  traceContext.fillRect(0, 0, traceWidth, traceHeight);
+  traceContext.drawImage(
+    sourceCanvas,
+    0,
+    0,
+    traceWidth,
+    traceHeight,
+  );
+
+  const imageData = traceContext.getImageData(
+    0,
+    0,
+    traceWidth,
+    traceHeight,
+  );
+
+  const binary = new Uint8Array(traceWidth * traceHeight);
+
+  for (let y = 1; y < traceHeight - 1; y += 1) {
+    for (let x = 1; x < traceWidth - 1; x += 1) {
+      const pixelIndex = (y * traceWidth + x) * 4;
+      const red = imageData.data[pixelIndex];
+      const green = imageData.data[pixelIndex + 1];
+      const blue = imageData.data[pixelIndex + 2];
+      const alpha = imageData.data[pixelIndex + 3];
+
+      const luminance =
+        red * 0.2126 +
+        green * 0.7152 +
+        blue * 0.0722;
+
+      const maxChannel = Math.max(red, green, blue);
+      const minChannel = Math.min(red, green, blue);
+      const saturation = maxChannel - minChannel;
+
+      if (
+        alpha > 24 &&
+        (luminance < 218 || saturation > 40)
+      ) {
+        binary[y * traceWidth + x] = 1;
+      }
+    }
+  }
+
+  const skeleton = thinBinaryImage(
+    binary,
+    traceWidth,
+    traceHeight,
+  );
+
+  const neighborOffsets = [
+    [-1, -1],
+    [0, -1],
+    [1, -1],
+    [-1, 0],
+    [1, 0],
+    [-1, 1],
+    [0, 1],
+    [1, 1],
+  ] as const;
+
+  const neighborsOf = (index: number): number[] => {
+    const x = index % traceWidth;
+    const y = Math.floor(index / traceWidth);
+    const result: number[] = [];
+
+    for (const [dx, dy] of neighborOffsets) {
+      const nx = x + dx;
+      const ny = y + dy;
+
+      if (
+        nx < 0 ||
+        nx >= traceWidth ||
+        ny < 0 ||
+        ny >= traceHeight
+      ) {
+        continue;
+      }
+
+      const next = ny * traceWidth + nx;
+
+      if (skeleton[next]) {
+        result.push(next);
+      }
+    }
+
+    return result;
+  };
+
+  const edgeKey = (a: number, b: number) =>
+    a < b ? `${a}:${b}` : `${b}:${a}`;
+
+  const visitedEdges = new Set<string>();
+  const rawStrokes: number[][] = [];
+
+  const followEdge = (
+    start: number,
+    next: number,
+  ): number[] => {
+    const path = [start, next];
+    visitedEdges.add(edgeKey(start, next));
+
+    let previous = start;
+    let current = next;
+
+    while (true) {
+      const candidates = neighborsOf(current).filter(
+        (candidate) =>
+          candidate !== previous &&
+          !visitedEdges.has(edgeKey(current, candidate)),
+      );
+
+      if (candidates.length !== 1) {
+        break;
+      }
+
+      const following = candidates[0];
+      visitedEdges.add(edgeKey(current, following));
+      path.push(following);
+      previous = current;
+      current = following;
+    }
+
+    return path;
+  };
+
+  const starts: number[] = [];
+
+  for (let index = 0; index < skeleton.length; index += 1) {
+    if (!skeleton[index]) {
+      continue;
+    }
+
+    const degree = neighborsOf(index).length;
+
+    if (degree !== 2 && degree > 0) {
+      starts.push(index);
+    }
+  }
+
+  for (const start of starts) {
+    for (const neighbor of neighborsOf(start)) {
+      if (visitedEdges.has(edgeKey(start, neighbor))) {
+        continue;
+      }
+
+      const path = followEdge(start, neighbor);
+
+      if (path.length >= 3) {
+        rawStrokes.push(path);
+      }
+    }
+  }
+
+  // Remaining edges are closed loops.
+  for (let index = 0; index < skeleton.length; index += 1) {
+    if (!skeleton[index]) {
+      continue;
+    }
+
+    for (const neighbor of neighborsOf(index)) {
+      if (visitedEdges.has(edgeKey(index, neighbor))) {
+        continue;
+      }
+
+      const path = followEdge(index, neighbor);
+
+      if (path.length >= 3) {
+        rawStrokes.push(path);
+      }
+    }
+  }
+
+  const scaleX = sourceCanvas.width / traceWidth;
+  const scaleY = sourceCanvas.height / traceHeight;
+
+  const strokes = rawStrokes
+    .map((path) => {
+      const points = path.map((index) => ({
+        x: (index % traceWidth + 0.5) * scaleX,
+        y: (Math.floor(index / traceWidth) + 0.5) * scaleY,
+      }));
+
+      return {
+        points: simplifyTracePoints(points, 5),
+      };
+    })
+    .filter((stroke) => stroke.points.length >= 2)
+    .filter((stroke) => {
+      let length = 0;
+
+      for (let i = 1; i < stroke.points.length; i += 1) {
+        length += Math.hypot(
+          stroke.points[i].x - stroke.points[i - 1].x,
+          stroke.points[i].y - stroke.points[i - 1].y,
+        );
+      }
+
+      return length >= 18;
+    });
+
+  if (strokes.length <= 1) {
+    return strokes;
+  }
+
+  // Greedy pen ordering: continue from whichever stroke endpoint is nearest.
+  const remaining = strokes.slice();
+  const ordered: TracedStroke[] = [];
+  let currentPoint: RenderPoint = {
+    x: sourceCanvas.width / 2,
+    y: sourceCanvas.height / 2,
+  };
+
+  while (remaining.length > 0) {
+    let bestIndex = 0;
+    let reverse = false;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (let index = 0; index < remaining.length; index += 1) {
+      const stroke = remaining[index];
+      const first = stroke.points[0];
+      const last = stroke.points[stroke.points.length - 1];
+      const firstDistance = Math.hypot(
+        first.x - currentPoint.x,
+        first.y - currentPoint.y,
+      );
+      const lastDistance = Math.hypot(
+        last.x - currentPoint.x,
+        last.y - currentPoint.y,
+      );
+
+      if (firstDistance < bestDistance) {
+        bestDistance = firstDistance;
+        bestIndex = index;
+        reverse = false;
+      }
+
+      if (lastDistance < bestDistance) {
+        bestDistance = lastDistance;
+        bestIndex = index;
+        reverse = true;
+      }
+    }
+
+    const [stroke] = remaining.splice(bestIndex, 1);
+    const points = reverse
+      ? stroke.points.slice().reverse()
+      : stroke.points;
+
+    ordered.push({ points });
+    currentPoint = points[points.length - 1];
+  }
+
+  return ordered.slice(0, 600);
+}
+
+function countTracedStrokeUnits(
+  strokes: TracedStroke[],
+): number {
+  return strokes.reduce(
+    (sum, stroke) =>
+      sum + Math.max(1, stroke.points.length - 1),
+    0,
+  );
+}
+
+function paintTracedDoodle(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  strokes: TracedStroke[],
+  progress: number,
+) {
+  context.save();
+  context.globalCompositeOperation = "source-over";
+  context.fillStyle = BOARD_BACKGROUND;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.restore();
+
+  const totalUnits = Math.max(1, countTracedStrokeUnits(strokes));
+  let remaining = Math.ceil(totalUnits * Math.min(1, Math.max(0, progress)));
+
+  context.save();
+  context.strokeStyle = "#1f2937";
+  context.lineWidth = 4.6;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+
+  for (let strokeIndex = 0; strokeIndex < strokes.length; strokeIndex += 1) {
+    if (remaining <= 0) {
+      break;
+    }
+
+    const stroke = strokes[strokeIndex];
+    const units = Math.max(1, stroke.points.length - 1);
+    const visibleUnits = Math.min(units, remaining);
+
+    if (stroke.points.length >= 2 && visibleUnits > 0) {
+      context.globalAlpha = 0.92;
+      context.beginPath();
+      context.moveTo(stroke.points[0].x, stroke.points[0].y);
+
+      for (let index = 1; index <= visibleUnits; index += 1) {
+        context.lineTo(
+          stroke.points[index].x,
+          stroke.points[index].y,
+        );
+      }
+
+      context.stroke();
+
+      // A subtle second pass gives the dry-erase line a human retraced feel.
+      if (visibleUnits === units && strokeIndex % 3 === 0) {
+        const jitterX = deterministicStrokeJitter(strokeIndex + 91) * 1.5;
+        const jitterY = deterministicStrokeJitter(strokeIndex + 193) * 1.5;
+        context.globalAlpha = 0.24;
+        context.lineWidth = 3.2;
+        context.beginPath();
+        context.moveTo(
+          stroke.points[0].x + jitterX,
+          stroke.points[0].y + jitterY,
+        );
+
+        for (let index = 1; index < stroke.points.length; index += 1) {
+          context.lineTo(
+            stroke.points[index].x + jitterX,
+            stroke.points[index].y + jitterY,
+          );
+        }
+
+        context.stroke();
+      }
+    }
+
+    remaining -= visibleUnits;
+  }
+
+  context.restore();
+}
+
+function paintImageDoodleReveal(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  sourceCanvas: HTMLCanvasElement,
+  plan: DoodleRevealPlan,
+  progress: number,
+) {
+  const safeProgress = Math.min(1, Math.max(0, progress));
+
+  context.save();
+  context.globalCompositeOperation = "source-over";
+  context.fillStyle = BOARD_BACKGROUND;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.restore();
+
+  if (
+    !plan.maskContext ||
+    !plan.revealContext ||
+    plan.points.length === 0
+  ) {
+    /*
+     * Fallback for an unexpectedly blank/photographic model response:
+     * fade the image in rather than reverting to a directional wipe.
+     */
+    context.save();
+    context.globalAlpha = safeProgress;
+    context.drawImage(
+      sourceCanvas,
+      0,
+      0,
+      canvas.width,
+      canvas.height,
+    );
+    context.restore();
+    return;
+  }
+
+  const visibleCount = Math.min(
+    plan.points.length,
+    Math.ceil(plan.points.length * safeProgress),
+  );
+
+  if (visibleCount < plan.revealedCount) {
+    resetDoodleRevealPlan(plan);
+  }
+
+  const mask = plan.maskContext;
+  mask.save();
+  mask.strokeStyle = "#ffffff";
+  mask.fillStyle = "#ffffff";
+  mask.lineCap = "round";
+  mask.lineJoin = "round";
+  mask.lineWidth = 24;
+
+  for (
+    let index = plan.revealedCount;
+    index < visibleCount;
+    index += 1
+  ) {
+    const point = plan.points[index];
+    const previous = index > 0 ? plan.points[index - 1] : null;
+
+    if (
+      point.breakBefore ||
+      !previous ||
+      previous.breakBefore
+    ) {
+      mask.beginPath();
+      mask.arc(point.x, point.y, 12, 0, Math.PI * 2);
+      mask.fill();
+      continue;
+    }
+
+    mask.beginPath();
+    mask.moveTo(previous.x, previous.y);
+    mask.lineTo(point.x, point.y);
+    mask.stroke();
+
+    /*
+     * A second, thinner offset pass mimics the marker briefly retracing
+     * the same line. It overlaps the first pass instead of sweeping a
+     * fresh rectangular region.
+     */
+    if (index % 4 === 0) {
+      const offsetX = deterministicStrokeJitter(index + 911) * 2.2;
+      const offsetY = deterministicStrokeJitter(index + 1217) * 2.2;
+
+      mask.save();
+      mask.globalAlpha = 0.82;
+      mask.lineWidth = 12;
+      mask.beginPath();
+      mask.moveTo(
+        previous.x + offsetX,
+        previous.y + offsetY,
+      );
+      mask.lineTo(
+        point.x + offsetX,
+        point.y + offsetY,
+      );
+      mask.stroke();
+      mask.restore();
+    }
+  }
+
+  mask.restore();
+  plan.revealedCount = visibleCount;
+
+  const reveal = plan.revealContext;
+  reveal.save();
+  reveal.globalCompositeOperation = "source-over";
+  reveal.clearRect(
+    0,
+    0,
+    plan.revealCanvas.width,
+    plan.revealCanvas.height,
+  );
+  reveal.drawImage(
+    sourceCanvas,
+    0,
+    0,
+    plan.revealCanvas.width,
+    plan.revealCanvas.height,
+  );
+  reveal.globalCompositeOperation = "destination-in";
+  reveal.drawImage(plan.maskCanvas, 0, 0);
+  reveal.restore();
+
+  context.drawImage(
+    plan.revealCanvas,
+    0,
+    0,
+    canvas.width,
+    canvas.height,
+  );
+}
+
 function loadBoardImage(
   command: BoardImageCommand,
 ): Promise<HTMLImageElement> {
@@ -1218,7 +2568,11 @@ export default function PresentationBoard({
   savedDrawing,
   generatedCommand,
   generatedCommandVersion,
+  writingSpeed,
+  drawingSpeed,
+  animationPaused = false,
   onDrawingChange,
+  onCommandRenderComplete,
 }: PresentationBoardProps) {
   const isDrawingRef = useRef(false);
 
@@ -1239,6 +2593,21 @@ export default function PresentationBoard({
 
   const drawingLoadRunRef = useRef(0);
   const commandRenderRunRef = useRef(0);
+  const animationPausedRef = useRef(animationPaused);
+  const writingSpeedRef = useRef(writingSpeed);
+  const drawingSpeedRef = useRef(drawingSpeed);
+
+  useEffect(() => {
+    animationPausedRef.current = animationPaused;
+  }, [animationPaused]);
+
+  useEffect(() => {
+    writingSpeedRef.current = writingSpeed;
+  }, [writingSpeed]);
+
+  useEffect(() => {
+    drawingSpeedRef.current = drawingSpeed;
+  }, [drawingSpeed]);
 
   const drawingCanvas = useMemo(() => {
     if (typeof document === "undefined") {
@@ -1356,29 +2725,197 @@ export default function PresentationBoard({
       command: BoardCommand,
       targetBoardId: number,
       renderRun: number,
+      commandVersion: number,
     ) => {
       if (!drawingCanvas || !context) {
         return;
       }
 
-      // Do not paint a result onto a different board if the user
-      // switched boards while Gemini was answering.
-      if (
+      const isCancelled = () =>
         renderRun !== commandRenderRunRef.current ||
-        activeBoardIdRef.current !== targetBoardId
-      ) {
-        return;
-      }
+        activeBoardIdRef.current !== targetBoardId;
+
+      const animate = async (
+        durationMs: number,
+        drawFrame: (progress: number) => void,
+      ): Promise<boolean> => {
+        return new Promise((resolve) => {
+          let accumulated = 0;
+          let lastTimestamp: number | null = null;
+
+          const frame = (timestamp: number) => {
+            if (isCancelled()) {
+              resolve(false);
+              return;
+            }
+
+            if (lastTimestamp === null) {
+              lastTimestamp = timestamp;
+            }
+
+            const delta = Math.min(50, timestamp - lastTimestamp);
+            lastTimestamp = timestamp;
+
+            // Pausing voice also pauses the board-writing clock.
+            if (!animationPausedRef.current) {
+              accumulated += delta;
+            }
+
+            const progress = Math.min(
+              1,
+              accumulated / Math.max(1, durationMs),
+            );
+
+            drawFrame(progress);
+            refreshTexture();
+
+            if (progress >= 1) {
+              resolve(true);
+              return;
+            }
+
+            window.requestAnimationFrame(frame);
+          };
+
+          window.requestAnimationFrame(frame);
+        });
+      };
+
+      let completed = false;
 
       if (command.type === "image") {
         const image = await loadBoardImage(command);
 
-        // Image decoding is asynchronous. Check again after it finishes
-        // so an old result cannot paint onto a newly selected board.
-        if (
-          renderRun !== commandRenderRunRef.current ||
-          activeBoardIdRef.current !== targetBoardId
-        ) {
+        if (isCancelled()) {
+          return;
+        }
+
+        const fittedImage = createFittedImageCanvas(
+          image,
+          drawingCanvas.width,
+          drawingCanvas.height,
+        );
+
+        const doodleRevealPlan =
+          buildDoodleRevealPlan(fittedImage);
+
+        const duration = command.style === "doodle"
+          ? Math.min(
+              9500,
+              Math.max(
+                750,
+                480 +
+                  drawingUnitMs(drawingSpeedRef.current) *
+                    Math.max(5, doodleRevealPlan.points.length / 70),
+              ),
+            )
+          : Math.min(
+              12000,
+              Math.max(
+                700,
+                420 +
+                  drawingUnitMs(drawingSpeedRef.current) *
+                    Math.max(4, doodleRevealPlan.points.length / 80),
+              ),
+            );
+
+        completed = await animate(
+          duration,
+          (progress) => {
+            paintImageDoodleReveal(
+              context,
+              drawingCanvas,
+              fittedImage,
+              doodleRevealPlan,
+              progress,
+            );
+          },
+        );
+      } else if (command.type === "write_text") {
+        const characterCount = Math.max(
+          1,
+          countTextCommandCharacters(command),
+        );
+
+        const duration = Math.min(
+          30000,
+          Math.max(450, characterCount * writingDelayMs(writingSpeedRef.current)),
+        );
+
+        completed = await animate(
+          duration,
+          (progress) => {
+            const visibleCharacters = Math.ceil(
+              characterCount * progress,
+            );
+
+            renderBoardCommandToCanvas(
+              context,
+              drawingCanvas,
+              buildPartialTextCommand(
+                command,
+                visibleCharacters,
+              ),
+            );
+          },
+        );
+      } else if (command.type === "flowchart") {
+        const complexity =
+          Math.max(1, command.nodes.length) * 1.25 +
+          Math.max(1, command.edges.length) * 0.8;
+
+        const duration = Math.min(
+          24000,
+          1000 + drawingUnitMs(drawingSpeedRef.current) * complexity,
+        );
+
+        completed = await animate(
+          duration,
+          (progress) => {
+            renderBoardCommandToCanvas(
+              context,
+              drawingCanvas,
+              buildPartialFlowchartCommand(
+                command,
+                progress,
+              ),
+            );
+          },
+        );
+      } else {
+        const dataCount = Math.max(1, command.data.length);
+        const duration = Math.min(
+          18000,
+          1100 +
+            drawingUnitMs(drawingSpeedRef.current) *
+              Math.min(12, dataCount) *
+              0.7,
+        );
+
+        completed = await animate(
+          duration,
+          (progress) => {
+            renderBoardCommandToCanvas(
+              context,
+              drawingCanvas,
+              buildPartialChartCommand(
+                command,
+                progress,
+              ),
+            );
+          },
+        );
+      }
+
+      if (!completed || isCancelled()) {
+        return;
+      }
+
+      // Ensure the exact final scene is painted after the animation.
+      if (command.type === "image") {
+        const image = await loadBoardImage(command);
+
+        if (isCancelled()) {
           return;
         }
 
@@ -1404,12 +2941,18 @@ export default function PresentationBoard({
         targetBoardId,
         finishedDrawing,
       );
+
+      onCommandRenderComplete?.(
+        targetBoardId,
+        commandVersion,
+      );
     },
     [
       drawingCanvas,
       context,
       refreshTexture,
       onDrawingChange,
+      onCommandRenderComplete,
     ],
   );
 
@@ -1598,6 +3141,7 @@ export default function PresentationBoard({
       generatedCommand,
       boardId,
       renderRun,
+      generatedCommandVersion,
     ).catch((error) => {
       console.error(
         "Could not render whiteboard command:",
@@ -1617,6 +3161,13 @@ export default function PresentationBoard({
     return () => {
       if (commandRenderRunRef.current === renderRun) {
         commandRenderRunRef.current += 1;
+
+        if (
+          completedCommandRenderRef.current[boardId] ===
+          generatedCommandVersion
+        ) {
+          delete completedCommandRenderRef.current[boardId];
+        }
       }
     };
   }, [

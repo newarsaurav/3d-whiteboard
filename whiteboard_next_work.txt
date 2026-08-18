@@ -1,0 +1,13 @@
+- Drawing should be like handwriting
+- Gemini should be able to hold the previous conversation as well
+- should bew able ti watch the board and tell what has been written
+- the board is cleared only if the next response or question is not related to each other
+- if related the board should not be cleared
+- user prompt should be able to write/remove text/line/circle/underline on board 
+    eg: 1st prompt: draw a flowchart
+        2nd prompt: underline on start and stop text 
+                    (gemini should be able to underline the start and stop text )
+        3rd prompt: remove the underline for stop text 
+                    (gemini should be able to remove the underline from the stop text) 
+- Gemini should be able to see the board and if it is full than should be able to 
+    start on new board.

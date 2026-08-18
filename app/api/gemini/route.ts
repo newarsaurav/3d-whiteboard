@@ -817,6 +817,7 @@ async function buildImageCommand(
   args: Record<string, unknown>,
   mode: "create" | "edit",
   boardImagePart: Part | null,
+  currentCommandValue: unknown,
 ): Promise<BoardImageCommand> {
   const title = readString(args.title, "", 90);
 
@@ -833,14 +834,29 @@ async function buildImageCommand(
     );
   }
 
+  const currentCommand =
+    currentCommandValue && typeof currentCommandValue === "object"
+      ? (currentCommandValue as Record<string, unknown>)
+      : null;
+
+  const currentStyle =
+    currentCommand?.type === "image" &&
+    currentCommand.style === "realistic"
+      ? "realistic"
+      : currentCommand?.type === "image" &&
+          currentCommand.style === "doodle"
+        ? "doodle"
+        : null;
+
+  const prefersRealistic =
+    requestNeedsRealisticImage(requestedText) ||
+    (mode === "edit" && currentStyle === "realistic");
+
   if (mode === "edit" && !boardImagePart) {
     throw new Error(
       "I need the current board image before I can edit it. Please try the edit again.",
     );
   }
-
-  const prefersRealistic =
-    requestNeedsRealisticImage(requestedText);
 
   const styleInstructions = prefersRealistic
     ? [
@@ -848,12 +864,15 @@ async function buildImageCommand(
         "Render the subject convincingly with natural form and detail.",
       ].join("\n")
     : [
-        "Style: hand-drawn classroom whiteboard doodle.",
-        "Make it look like a teacher sketched it on a school whiteboard using marker pens.",
-        "Use simple marker strokes, slightly imperfect hand-drawn lines, and a clean doodle/illustration feel.",
-        "Prefer dark gray/black outlines with minimal blue/red/green marker accents when helpful.",
-        "Keep the background plain white or very close to white so it blends into the board.",
-        "Do NOT make it look like a pasted photo, glossy clip-art, or polished poster.",
+        "Style: simple classroom whiteboard marker drawing.",
+        "Use bold clean dark marker outlines on a pure white background.",
+        "Prioritize a clear recognizable silhouette first, then add only a few important interior details.",
+        "Make cartoon characters and animals easy to recognize from a distance.",
+        "Use loose hand-drawn contours with occasional retraced lines, small overshoots, and slight wobble.",
+        "Keep the drawing simple and readable: avoid tiny details, clutter, dense hatching, or broken fragmented lines.",
+        "Do not use gradients, shadows, photographic texture, or large filled areas.",
+        "Do not add text, labels, borders, watermarks, or a poster-like layout.",
+        "The final result should look like a teacher quickly sketched it with a black dry-erase marker.",
       ].join("\n");
 
   const imageInstructions =
@@ -883,6 +902,7 @@ ${styleInstructions}
 
 Rules:
 - Compose the subject clearly with comfortable margins so it looks good on a whiteboard.
+- Keep the subject large enough and visually simple enough to remain recognizable after whiteboard rendering.
 - Avoid unnecessary text, labels, frames, watermarks, or captions.
 - Use a clean neutral/light background when the user does not specify a setting.
 - Return only the generated image.
@@ -895,9 +915,9 @@ Rules:
   }
 
   const imageResponse = await ai.models.generateContent({
-    model:
-      process.env.GEMINI_IMAGE_MODEL ??
-      "gemini-3.1-flash-image",
+    model: prefersRealistic
+      ? process.env.GEMINI_IMAGE_MODEL ?? "gemini-3.1-flash-image"
+      : process.env.GEMINI_DOODLE_MODEL ?? "gemini-3.1-flash-lite-image",
     contents: [
       {
         role: "user",
@@ -939,6 +959,7 @@ Rules:
     type: "image",
     ...(title ? { title } : {}),
     imageDataUrl: `data:${mimeType};base64,${imageData}`,
+    style: prefersRealistic ? "realistic" : "doodle",
     mode,
   };
 }
@@ -961,6 +982,7 @@ function serializeCurrentCommand(value: unknown): string {
           ? command.title.slice(0, 90)
           : undefined,
       mode: command.mode,
+      style: command.style,
       note:
         "The current board contains an AI-generated image. Inspect the attached board screenshot for visual details when it is provided.",
     });
@@ -1016,8 +1038,10 @@ export async function POST(request: Request) {
       ? readBoardImage(boardImage)
       : null;
 
+    const currentCommandValue = body.currentCommand;
+
     const currentCommand = serializeCurrentCommand(
-      body.currentCommand,
+      currentCommandValue,
     );
 
     const routerInstructions = `
@@ -1072,7 +1096,7 @@ ${prompt}
     const response = await ai.models.generateContent({
       model:
         process.env.GEMINI_MODEL ??
-        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
       contents: [
         {
           role: "user",
@@ -1146,6 +1170,7 @@ ${prompt}
         args,
         "create",
         null,
+        currentCommandValue,
       );
     } else if (functionCall.name === "edit_board_image") {
       command = await buildImageCommand(
@@ -1153,6 +1178,7 @@ ${prompt}
         args,
         "edit",
         boardImagePart,
+        currentCommandValue,
       );
     } else {
       return NextResponse.json(
