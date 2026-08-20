@@ -17,6 +17,7 @@ import {
   Environment,
   OrbitControls,
 } from "@react-three/drei";
+import * as THREE from "three";
 
 import MikeModel from "./MikeModel";
 import type {
@@ -946,10 +947,6 @@ export default function LixiaStudio() {
         );
 
 
-        await new Promise<void>((resolve) => {
-          window.setTimeout(resolve, 180);
-        });
-
         if (runId !== teachingRunRef.current) {
           return;
         }
@@ -961,15 +958,7 @@ export default function LixiaStudio() {
             ],
         );
 
-        await speakTeachingSegment(
-          segment.narration,
-          lesson.language ?? "en-US",
-          runId,
-        );
-
-<!--         conflict changed 
-  // Start speaking while Lixia writes, like a real teacher.
-        // Do not advance to the next segment until BOTH have finished.
+        // Speak while the board writes. Do not advance until both finish.
         await Promise.all([
           boardFinished,
           speakTeachingSegment(
@@ -977,8 +966,7 @@ export default function LixiaStudio() {
             lesson.language ?? "en-US",
             runId,
           ),
-        ]); -->
-
+        ]);
       }
     } finally {
       if (runId === teachingRunRef.current) {
@@ -1608,7 +1596,7 @@ export default function LixiaStudio() {
         </div>
 
         <Canvas
-          shadows
+          shadows={{ type: THREE.PCFShadowMap }}
           camera={{
             position:
               DEFAULT_CAMERA_POSITION,
