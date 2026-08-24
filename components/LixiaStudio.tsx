@@ -27,7 +27,10 @@ import type {
 import { presentationDirector } from "@lixia/mike-animation";
 
 import PresentationBoard from "./PresentationBoard";
-import type { DrawingTool } from "./PresentationBoard";
+import type {
+  DrawingTool,
+  TextSize,
+} from "./PresentationBoard";
 
 import StudioEnvironment from "./StudioEnvironment";
 
@@ -404,6 +407,9 @@ export default function LixiaStudio() {
   // 10 = slow and deliberate, 100 = very fast.
   const [writingSpeed, setWritingSpeed] =
     useState(55);
+
+  const [textSize, setTextSize] =
+    useState<TextSize>("medium");
 
   const [drawingSpeed, setDrawingSpeed] =
     useState(55);
@@ -967,17 +973,17 @@ export default function LixiaStudio() {
           runId,
         );
 
-<!--         conflict changed 
-  // Start speaking while Lixia writes, like a real teacher.
-        // Do not advance to the next segment until BOTH have finished.
-        await Promise.all([
-          boardFinished,
-          speakTeachingSegment(
-            segment.narration,
-            lesson.language ?? "en-US",
-            runId,
-          ),
-        ]); -->
+// <!--         conflict changed 
+//   // Start speaking while Lixia writes, like a real teacher.
+//         // Do not advance to the next segment until BOTH have finished.
+//         await Promise.all([
+//           boardFinished,
+//           speakTeachingSegment(
+//             segment.narration,
+//             lesson.language ?? "en-US",
+//             runId,
+//           ),
+//         ]); -->
 
       }
     } finally {
@@ -1477,6 +1483,20 @@ export default function LixiaStudio() {
               fontSize: 12,
             }}
           >
+            <div className="text-size-controls" aria-label="Board text size">
+              {(["small", "medium", "large"] as TextSize[]).map((size) => (
+                <button
+                  key={size}
+                  type="button"
+                  className={textSize === size ? "active" : ""}
+                  aria-pressed={textSize === size}
+                  onClick={() => setTextSize(size)}
+                >
+                  {size[0].toUpperCase() + size.slice(1)}
+                </button>
+              ))}
+            </div>
+
             <label
               style={{
                 display: "grid",
@@ -1662,6 +1682,7 @@ export default function LixiaStudio() {
             generatedCommandVersion={
               activeBoard.generatedCommandVersion
             }
+            textSize={textSize}
             writingSpeed={writingSpeed}
             drawingSpeed={drawingSpeed}
             animationPaused={isTeachingPaused}

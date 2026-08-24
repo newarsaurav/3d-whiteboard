@@ -19,6 +19,7 @@ import type {
 } from "@/types/board";
 
 export type DrawingTool = "pen" | "eraser";
+export type TextSize = "small" | "medium" | "large";
 
 interface PresentationBoardProps {
   position: [number, number, number];
@@ -35,6 +36,7 @@ interface PresentationBoardProps {
 
   generatedCommand: BoardCommand | null;
   generatedCommandVersion: number;
+  textSize: TextSize;
 
   // 10 = slow, 100 = fast.
   writingSpeed: number;
@@ -328,12 +330,18 @@ function drawCenteredWrappedText(
 function renderTextCommand(
   context: CanvasRenderingContext2D,
   command: BoardTextCommand,
+  textSize: TextSize,
 ) {
   const marginX = 95;
+  const sizeScale = {
+    small: 0.8,
+    medium: 1,
+    large: 1.2,
+  }[textSize];
 
   context.fillStyle = "#312e81";
   context.font =
-    '600 64px "Lixia Handwriting", "Comic Sans MS", cursive';
+    `600 ${64 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
   context.textAlign = "left";
   context.textBaseline = "top";
 
@@ -347,16 +355,16 @@ function renderTextCommand(
     context.fillText(
       line,
       marginX,
-      62 + index * 72,
+      62 + index * 72 * sizeScale,
     );
   });
 
   let currentY =
-    62 + Math.max(1, titleLines.length) * 78 + 24;
+    62 + Math.max(1, titleLines.length) * 78 * sizeScale + 24;
 
   context.fillStyle = BOARD_INK;
   context.font =
-    '400 42px "Lixia Handwriting", "Comic Sans MS", cursive';
+    `400 ${42 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
 
   for (const bullet of command.bullets.slice(0, 8)) {
     const lines = getWrappedLines(
@@ -365,7 +373,7 @@ function renderTextCommand(
       CANVAS_WIDTH - 250,
     );
 
-    if (currentY + lines.length * 54 > 760) {
+    if (currentY + lines.length * 54 * sizeScale > 760) {
       break;
     }
 
@@ -383,11 +391,11 @@ function renderTextCommand(
       context.fillText(
         line,
         marginX + 42,
-        currentY + index * 54,
+        currentY + index * 54 * sizeScale,
       );
     });
 
-    currentY += Math.max(1, lines.length) * 54 + 18;
+    currentY += Math.max(1, lines.length) * 54 * sizeScale + 18;
   }
 
   if (command.formulas && command.formulas.length > 0 && currentY < 730) {
@@ -395,13 +403,13 @@ function renderTextCommand(
 
     context.fillStyle = "#4338ca";
     context.font =
-      '600 30px "Lixia Handwriting", "Comic Sans MS", cursive';
+      `600 ${30 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
     context.fillText("Formula", marginX, currentY + 2);
 
-    currentY += 48;
+    currentY += 48 * sizeScale;
 
     for (const formula of command.formulas.slice(0, 4)) {
-      if (currentY + 78 > 770) {
+      if (currentY + 78 * sizeScale > 770) {
         break;
       }
 
@@ -417,24 +425,24 @@ function renderTextCommand(
           CANVAS_WIDTH - marginX * 2,
           980,
         ),
-        68,
-        16,
+        68 * sizeScale,
+        16 * sizeScale,
       );
       context.fill();
       context.stroke();
 
       context.fillStyle = "#1e1b4b";
       context.font =
-        '600 46px "Lixia Handwriting", "Comic Sans MS", cursive';
+        `600 ${46 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
       context.textAlign = "left";
       context.textBaseline = "middle";
       context.fillText(
         formula,
         marginX + 28,
-        currentY + 34,
+        currentY + 34 * sizeScale,
       );
 
-      currentY += 82;
+      currentY += 82 * sizeScale;
     }
 
     context.restore();
@@ -454,15 +462,15 @@ function renderTextCommand(
       marginX,
       Math.min(currentY + 6, 760),
       CANVAS_WIDTH - marginX * 2,
-      92,
-      18,
+      92 * sizeScale,
+      18 * sizeScale,
     );
     context.fill();
     context.stroke();
 
     context.fillStyle = "#3730a3";
     context.font =
-      '600 32px "Lixia Handwriting", "Comic Sans MS", cursive';
+      `600 ${32 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
     context.textBaseline = "middle";
 
     const noteLines = getWrappedLines(
@@ -476,7 +484,7 @@ function renderTextCommand(
         line,
         marginX + 28,
         Math.min(currentY + 52, 806) +
-          (index - (noteLines.length - 1) / 2) * 34,
+          (index - (noteLines.length - 1) / 2) * 34 * sizeScale,
       );
     });
 
@@ -1281,6 +1289,7 @@ function renderBoardCommandToCanvas(
   context: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
   command: BoardCommand,
+  textSize: TextSize = "medium",
 ) {
   context.save();
   context.globalCompositeOperation = "source-over";
@@ -1291,7 +1300,7 @@ function renderBoardCommandToCanvas(
   context.save();
 
   if (command.type === "write_text") {
-    renderTextCommand(context, command);
+    renderTextCommand(context, command, textSize);
   } else if (command.type === "flowchart") {
     renderFlowchartCommand(context, command);
   } else if (command.type === "chart") {
@@ -2568,6 +2577,7 @@ export default function PresentationBoard({
   savedDrawing,
   generatedCommand,
   generatedCommandVersion,
+  textSize,
   writingSpeed,
   drawingSpeed,
   animationPaused = false,
@@ -2856,6 +2866,7 @@ export default function PresentationBoard({
                 command,
                 visibleCharacters,
               ),
+              textSize,
             );
           },
         );
@@ -2929,6 +2940,7 @@ export default function PresentationBoard({
           context,
           drawingCanvas,
           command,
+          textSize,
         );
       }
 
@@ -2953,6 +2965,7 @@ export default function PresentationBoard({
       refreshTexture,
       onDrawingChange,
       onCommandRenderComplete,
+      textSize,
     ],
   );
 
@@ -3118,6 +3131,12 @@ export default function PresentationBoard({
    * which is then painted onto this same board canvas.
    */
   useEffect(() => {
+    if (generatedCommand?.type === "write_text") {
+      delete completedCommandRenderRef.current[boardId];
+    }
+  }, [boardId, generatedCommand, textSize]);
+
+  useEffect(() => {
     const alreadyRenderedVersion =
       completedCommandRenderRef.current[boardId];
 
@@ -3177,6 +3196,7 @@ export default function PresentationBoard({
     drawingCanvas,
     context,
     renderCommandToBoard,
+    textSize,
   ]);
 
   /*
