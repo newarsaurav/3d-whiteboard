@@ -1190,3 +1190,9 @@ input {
   font-weight: 400;
   font-display: swap;
 }
+
+.board-preview-placeholder,
+.assistant-message,
+.assistant-response-text {
+  font-family: "Lixia Handwriting", cursive;
+}

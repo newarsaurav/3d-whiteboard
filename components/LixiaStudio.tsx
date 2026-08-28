@@ -37,6 +37,7 @@ import StudioEnvironment from "./StudioEnvironment";
 import type {
   Board,
   BoardCommand,
+  BoardManagementCommand,
   TeacherLessonCommand,
 } from "@/types/board";
 
@@ -104,35 +105,6 @@ function InitialCameraSetup() {
 
     camera.updateProjectionMatrix();
   }, [camera]);
-
-  return null;
-}
-
-function getLocalBoardCommand(
-  prompt: string,
-): "clear" | "new" | null {
-  const normalized = prompt
-    .toLowerCase()
-    .replace(/[.!?]+$/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (
-    normalized === "clear board" ||
-    normalized === "clear the board" ||
-    normalized === "erase board" ||
-    normalized === "erase the board"
-  ) {
-    return "clear";
-  }
-
-  if (
-    normalized === "new board" ||
-    normalized === "add board" ||
-    normalized === "create new board"
-  ) {
-    return "new";
-  }
 
   return null;
 }
@@ -208,6 +180,78 @@ function getBoardImageForGemini(
   }
 
   return null;
+}
+
+function estimateTextCommandLength(
+  command: BoardCommand,
+): number {
+  if (command.type !== "write_text") {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return [
+    command.title,
+    ...command.bullets,
+    ...(command.formulas ?? []),
+    command.note ?? "",
+  ].join(" ").length;
+}
+
+function canAppendTextCommand(
+  currentCommand: BoardCommand | null,
+  nextCommand: BoardCommand,
+): currentCommand is Extract<BoardCommand, { type: "write_text" }> {
+  if (
+    !currentCommand ||
+    currentCommand.type !== "write_text" ||
+    nextCommand.type !== "write_text"
+  ) {
+    return false;
+  }
+
+  const addsTitleBullet =
+    nextCommand.title.trim() &&
+    nextCommand.title.trim() !== currentCommand.title.trim()
+      ? 1
+      : 0;
+
+  return (
+    currentCommand.bullets.length +
+      nextCommand.bullets.length +
+      addsTitleBullet <= 7 &&
+    (currentCommand.formulas?.length ?? 0) +
+      (nextCommand.formulas?.length ?? 0) <= 3 &&
+    estimateTextCommandLength(currentCommand) +
+      estimateTextCommandLength(nextCommand) <= 950
+  );
+}
+
+function appendTextCommand(
+  currentCommand: Extract<BoardCommand, { type: "write_text" }>,
+  nextCommand: Extract<BoardCommand, { type: "write_text" }>,
+): Extract<BoardCommand, { type: "write_text" }> {
+  const titleBullet =
+    nextCommand.title.trim() &&
+    nextCommand.title.trim() !== currentCommand.title.trim()
+      ? [`${nextCommand.title.trim()}:`]
+      : [];
+
+  return {
+    type: "write_text",
+    title: currentCommand.title,
+    bullets: [
+      ...currentCommand.bullets,
+      ...titleBullet,
+      ...nextCommand.bullets,
+    ],
+    formulas: [
+      ...(currentCommand.formulas ?? []),
+      ...(nextCommand.formulas ?? []),
+    ],
+    note: [currentCommand.note, nextCommand.note]
+      .filter((note): note is string => Boolean(note?.trim()))
+      .join(" "),
+  };
 }
 
 function makeFormulaSpeakable(formula: string): string {
@@ -1051,7 +1095,7 @@ export default function LixiaStudio() {
     setActiveBoardId(boardId);
   }
 
-  function addBoard() {
+  function addBoard(): number {
     const nextId =
       boards.length === 0
         ? 1
@@ -1074,6 +1118,8 @@ export default function LixiaStudio() {
 
     boardVersionRef.current[nextId] = 0;
     setActiveBoardId(nextId);
+
+    return nextId;
   }
 
   function deleteBoard(boardId: number) {
@@ -1162,42 +1208,6 @@ export default function LixiaStudio() {
       stopTeaching();
     }
 
-    /*
-     * Very obvious board commands do not need Gemini at all.
-     * This makes them instant and saves an API request.
-     */
-    const localCommand = getLocalBoardCommand(prompt);
-
-    if (localCommand === "clear") {
-      clearBoard();
-      setAssistantPrompt("");
-      setAssistantError(null);
-
-      const quickCommand: BoardCommand = {
-        type: "write_text",
-        title: "Board cleared",
-        bullets: [],
-      };
-
-      void speakSingleBoardResponse(quickCommand);
-      return;
-    }
-
-    if (localCommand === "new") {
-      addBoard();
-      setAssistantPrompt("");
-      setAssistantError(null);
-
-      const quickCommand: BoardCommand = {
-        type: "write_text",
-        title: "New board created",
-        bullets: [],
-      };
-
-      void speakSingleBoardResponse(quickCommand);
-      return;
-    }
-
     // Remember the exact board that started this request.
     const targetBoardId = activeBoardId;
     const targetBoard = boards.find(
@@ -1240,8 +1250,7 @@ export default function LixiaStudio() {
         },
         body: JSON.stringify({
           prompt,
-          currentCommand:
-            targetBoard.generatedCommand,
+          currentCommand: targetBoard.generatedCommand,
           boardImage: sendBoardImage
             ? boardImageForGemini
             : null,
@@ -1251,6 +1260,7 @@ export default function LixiaStudio() {
       const data = (await response.json()) as {
         tool?: string;
         command?: BoardCommand | TeacherLessonCommand;
+        management?: BoardManagementCommand;
         error?: string;
       };
 
@@ -1258,6 +1268,45 @@ export default function LixiaStudio() {
         throw new Error(
           data.error ?? "Gemini request failed.",
         );
+      }
+
+      if (data.management) {
+        if (data.management.action === "clear") {
+          clearBoard();
+        } else if (data.management.action === "delete") {
+          deleteBoard(targetBoardId);
+        } else {
+          const newBoardId = addBoard();
+          const newCommand: BoardCommand = {
+            type: "write_text",
+            title: data.management.title ?? data.management.topic ?? "New board",
+            bullets: data.management.bullets ?? [],
+            ...(data.management.formulas
+              ? { formulas: data.management.formulas }
+              : {}),
+            ...(data.management.note
+              ? { note: data.management.note }
+              : {}),
+          };
+          const nextVersion = 1;
+
+          boardVersionRef.current[newBoardId] = nextVersion;
+          setBoards((currentBoards) =>
+            currentBoards.map((board) =>
+              board.id === newBoardId
+                ? {
+                    ...board,
+                    generatedCommand: newCommand,
+                    generatedCommandVersion: nextVersion,
+                  }
+                : board,
+            ),
+          );
+          void speakSingleBoardResponse(newCommand);
+        }
+
+        setAssistantPrompt("");
+        return;
       }
 
       if (!data.command) {
@@ -1279,19 +1328,41 @@ export default function LixiaStudio() {
         return;
       }
 
+      // Keep earlier text answers visible when the active board has room.
+      // Structured visuals stay intact by moving a new answer to a fresh board.
+      const shouldAppend = canAppendTextCommand(
+        targetBoard.generatedCommand,
+        command,
+      );
+      const nextCommand =
+        shouldAppend &&
+        targetBoard.generatedCommand?.type === "write_text" &&
+        command.type === "write_text"
+          ? appendTextCommand(
+              targetBoard.generatedCommand,
+              command,
+            )
+          : command;
+      const needsNewBoard =
+        targetBoard.generatedCommand !== null &&
+        !shouldAppend;
+      const commandTargetBoardId = needsNewBoard
+        ? addBoard()
+        : targetBoardId;
+
       // command is now narrowed to BoardCommand.
       const nextVersion =
-        (boardVersionRef.current[targetBoardId] ??
-          targetBoard.generatedCommandVersion) + 1;
+        (boardVersionRef.current[commandTargetBoardId] ??
+          (needsNewBoard ? 0 : targetBoard.generatedCommandVersion)) + 1;
 
-      boardVersionRef.current[targetBoardId] = nextVersion;
+      boardVersionRef.current[commandTargetBoardId] = nextVersion;
 
       setBoards((currentBoards) =>
         currentBoards.map((board) =>
-          board.id === targetBoardId
+          board.id === commandTargetBoardId
             ? {
                 ...board,
-                generatedCommand: command,
+                generatedCommand: nextCommand,
                 generatedCommandVersion: nextVersion,
               }
             : board,

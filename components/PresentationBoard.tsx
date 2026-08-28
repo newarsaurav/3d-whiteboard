@@ -2745,6 +2745,15 @@ export default function PresentationBoard({
         renderRun !== commandRenderRunRef.current ||
         activeBoardIdRef.current !== targetBoardId;
 
+      if (
+        command.type === "write_text" ||
+        command.type === "flowchart"
+      ) {
+        await document.fonts.load(
+          '400 42px "Lixia Handwriting"',
+        );
+      }
+
       const animate = async (
         durationMs: number,
         drawFrame: (progress: number) => void,

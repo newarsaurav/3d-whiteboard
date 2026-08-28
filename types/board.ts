@@ -90,6 +90,21 @@ export interface BoardImageCommand {
   mode: "create" | "edit";
 }
 
+export type BoardManagementAction =
+  | "create"
+  | "delete"
+  | "clear";
+
+export interface BoardManagementCommand {
+  type: "manage_board";
+  action: BoardManagementAction;
+  topic?: string;
+  title?: string;
+  bullets?: string[];
+  formulas?: string[];
+  note?: string;
+}
+
 export type BoardCommand =
   | BoardTextCommand
   | BoardFlowchartCommand

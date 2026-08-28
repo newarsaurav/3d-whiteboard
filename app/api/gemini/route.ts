@@ -11,6 +11,7 @@ import type {
   BoardCommand,
   BoardFlowchartCommand,
   BoardImageCommand,
+  BoardManagementCommand,
   BoardTextCommand,
   TeacherLessonCommand,
   FlowchartEdge,
@@ -89,6 +90,45 @@ const writeTextDeclaration: FunctionDeclaration = {
       },
     },
     required: ["title", "bullets"],
+  },
+};
+
+const manageBoardDeclaration: FunctionDeclaration = {
+  name: "manage_board",
+  description:
+    "Manage whiteboard tabs when the user asks to create/add a new board, delete/remove the current board, or clear the current board. For create, include concise initial board content about the requested topic.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      action: {
+        type: "string",
+        enum: ["create", "delete", "clear"],
+        description: "The board management action to perform.",
+      },
+      topic: {
+        type: "string",
+        description: "Topic for a newly created board.",
+      },
+      title: {
+        type: "string",
+        description: "Short initial title for a newly created board.",
+      },
+      bullets: {
+        type: "array",
+        description: "Up to eight concise initial teaching bullets for a new board.",
+        items: { type: "string" },
+      },
+      formulas: {
+        type: "array",
+        description: "Optional initial formulas for a new board.",
+        items: { type: "string" },
+      },
+      note: {
+        type: "string",
+        description: "Optional initial note for a new board.",
+      },
+    },
+    required: ["action"],
   },
 };
 
@@ -1057,6 +1097,7 @@ ROUTING RULES:
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
 - generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
 - edit_board_image: modify a visual already visible on the board, for example "add a dog beside that cat", "remove the tree", or "make the cat bigger". By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
+- manage_board: create/add a new board, delete/remove the current board, or clear the current board. For create, include concise initial content in the same tool call.
 
 BOARD CONTEXT:
 - The current structured board content is included below.
@@ -1109,6 +1150,7 @@ ${prompt}
           {
             functionDeclarations: [
               writeTextDeclaration,
+              manageBoardDeclaration,
               teachLessonDeclaration,
               drawFlowchartDeclaration,
               plotWeatherHistoryDeclaration,
@@ -1154,9 +1196,45 @@ ${prompt}
         ? (functionCall.args as Record<string, unknown>)
         : {};
 
-    let command: BoardCommand | TeacherLessonCommand;
+    let command: BoardCommand | TeacherLessonCommand | BoardManagementCommand;
 
-    if (functionCall.name === "write_text") {
+    if (functionCall.name === "manage_board") {
+      const action = readString(args.action, "", 20);
+
+      if (action !== "create" && action !== "delete" && action !== "clear") {
+        throw new Error("Gemini returned an invalid board management action.");
+      }
+
+      command = {
+        type: "manage_board",
+        action,
+        ...(readString(args.topic, "", 120)
+          ? { topic: readString(args.topic, "", 120) }
+          : {}),
+        ...(action === "create"
+          ? {
+              title: readString(args.title, "New board", 90),
+              bullets: Array.isArray(args.bullets)
+                ? args.bullets
+                    .map((bullet) => readString(bullet, "", 180))
+                    .filter(Boolean)
+                    .slice(0, 8)
+                : [],
+              ...(Array.isArray(args.formulas)
+                ? {
+                    formulas: args.formulas
+                      .map((formula) => readString(formula, "", 120))
+                      .filter(Boolean)
+                      .slice(0, 4),
+                  }
+                : {}),
+              ...(readString(args.note, "", 240)
+                ? { note: readString(args.note, "", 240) }
+                : {}),
+            }
+          : {}),
+      };
+    } else if (functionCall.name === "write_text") {
       command = buildTextCommand(args);
     } else if (functionCall.name === "teach_lesson") {
       command = buildTeacherLessonCommand(args);
@@ -1185,6 +1263,13 @@ ${prompt}
         { error: `Unsupported Gemini tool: ${functionCall.name}` },
         { status: 502 },
       );
+    }
+
+    if (command.type === "manage_board") {
+      return NextResponse.json({
+        tool: functionCall.name,
+        management: command,
+      });
     }
 
     return NextResponse.json({
