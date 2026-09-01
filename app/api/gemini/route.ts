@@ -16,6 +16,12 @@ import type {
   FlowchartEdge,
   FlowchartNode,
 } from "@/types/board";
+import {
+  INVALID_GEMINI_KEY_FORMAT,
+  MISSING_GEMINI_KEY,
+  isGeminiApiKeyFormat,
+  readGeminiApiKey,
+} from "../../../lib/geminiAuth";
 
 export const runtime = "nodejs";
 
@@ -95,7 +101,7 @@ const writeTextDeclaration: FunctionDeclaration = {
 const teachLessonDeclaration: FunctionDeclaration = {
   name: "teach_lesson",
   description:
-    "Teach a concept like a real teacher: speak a detailed but clear explanation while progressively updating the whiteboard with definitions, formulas, and examples. Use when the user asks to explain, teach, walk through, or help them understand a concept in some depth. Do not use for a simple one-line factual answer.",
+    "Teach a concept like a real teacher: speak a detailed explanation and create a separate concise whiteboard aid with definitions, formulas, and examples. The board must not transcribe the speech. Use when the user asks to explain, teach, walk through, or help them understand a concept in some depth. Do not use for a simple one-line factual answer.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -111,7 +117,7 @@ const teachLessonDeclaration: FunctionDeclaration = {
       segments: {
         type: "array",
         description:
-          "Two to six sequential teaching segments. Each segment contains natural spoken narration and the COMPLETE cumulative board state that should be visible while that narration is spoken.",
+          "Two to six sequential teaching segments. Each contains natural spoken narration and a COMPLETE cumulative concise board outline. Board wording must be distinct from the narration.",
         items: {
           type: "object",
           properties: {
@@ -127,7 +133,7 @@ const teachLessonDeclaration: FunctionDeclaration = {
             boardBullets: {
               type: "array",
               description:
-                "Complete cumulative short bullet list visible at this point in the lesson.",
+                "Complete cumulative list of short keywords and teaching points. Never use full narration sentences or captions.",
               items: { type: "string" },
             },
             formulas: {
@@ -995,14 +1001,41 @@ function serializeCurrentCommand(value: unknown): string {
   }
 }
 
+export async function GET() {
+  const apiKey = readGeminiApiKey();
+
+  if (!apiKey) {
+    return NextResponse.json(
+      { ok: false, error: MISSING_GEMINI_KEY },
+      { status: 500 },
+    );
+  }
+
+  if (!isGeminiApiKeyFormat(apiKey)) {
+    return NextResponse.json(
+      { ok: false, error: INVALID_GEMINI_KEY_FORMAT },
+      { status: 401 },
+    );
+  }
+
+  return NextResponse.json({ ok: true });
+}
+
 export async function POST(request: Request) {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = readGeminiApiKey();
 
     if (!apiKey) {
       return NextResponse.json(
-        { error: "GEMINI_API_KEY is missing from .env.local." },
+        { error: MISSING_GEMINI_KEY },
         { status: 500 },
+      );
+    }
+
+    if (!isGeminiApiKeyFormat(apiKey)) {
+      return NextResponse.json(
+        { error: INVALID_GEMINI_KEY_FORMAT },
+        { status: 401 },
       );
     }
 
@@ -1052,7 +1085,7 @@ Do not answer with normal prose.
 
 ROUTING RULES:
 - write_text: short definitions, concise factual answers, or brief explanations that do NOT need a spoken lesson.
-- teach_lesson: detailed explanations, teaching, walkthroughs, formulas, worked examples, or when the user says explain/teach/help me understand. It should sound like a real teacher while the board progressively fills in.
+- teach_lesson: detailed explanations, teaching, walkthroughs, formulas, worked examples, or when the user says explain/teach/help me understand. It should sound like a real teacher using the board as a separate visual aid.
 - draw_flowchart: flowcharts, workflows, processes, decision trees, sequences with arrows.
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
 - generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
@@ -1071,7 +1104,8 @@ BOARD CONTEXT:
 - Default image style should be a whiteboard doodle / marker sketch. Only choose realistic/photo style when the user clearly asks for it.
 - Use edit_board_image only when the request refers to visual content already on the current board.
 - For teach_lesson, make every segment board state cumulative: later segments must keep useful content/formulas from earlier segments while adding the next idea.
-- Keep teach_lesson narration conversational and more detailed than the board. The board is the concise visual summary; narration is the fuller explanation.
+- The board is NEVER captions or a transcript. Write only a compact topic outline, keywords, formulas, and short teaching points that explain the subject visually.
+- Keep teach_lesson narration conversational and substantially more detailed than the board. Do not copy narration sentences into board bullets.
 - For formulas, put symbolic notation on the board, but phrase the narration naturally. Example: board shows "a = Δv / Δt" while narration says "acceleration equals change in velocity divided by change in time."
 - Prefer 3-5 lesson segments so the learner sees the board develop step by step.
 - For teach_lesson, give every segment a gesture that matches its narration. Vary the gestures across the lesson: typically open with welcome/ready, use explain/point/emphasize in the middle, and end with approve/goodbye. Do not repeat the same gesture in consecutive segments unless it clearly fits.
@@ -1194,14 +1228,23 @@ ${prompt}
   } catch (error) {
     console.error("Gemini tool router error:", error);
 
-    const message =
+    const raw =
       error instanceof Error
         ? error.message
         : "Lixia could not complete that whiteboard request.";
 
+    const isAuthFailure =
+      raw.includes("UNAUTHENTICATED") ||
+      raw.includes("401") ||
+      raw.includes("ACCESS_TOKEN_TYPE_UNSUPPORTED");
+
     return NextResponse.json(
-      { error: message },
-      { status: 500 },
+      {
+        error: isAuthFailure
+          ? "Gemini rejected the API key. Confirm GEMINI_API_KEY in .env.local is the full AI Studio key (AQ. or AIza), then restart npm run dev."
+          : raw,
+      },
+      { status: isAuthFailure ? 401 : 500 },
     );
   }
 }

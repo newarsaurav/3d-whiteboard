@@ -4,7 +4,7 @@
  * Animated Mike for whiteboard mode.
  *
  * Loads the canonical MIKE_RealLixia.glb and plays pre-baked animation clips
- * from the committed Lixia mobile-core pack (public/lixia-animation/v1)
+ * from the final-approved Lixia presentation pack (public/lixia-animation/v2)
  * through the @lixia/mike-animation runtime: registry admission, priority
  * scheduling, crossfades, and an additive upper-body gesture layer that
  * plays over the idle without replacing the legs.
@@ -45,6 +45,18 @@ export interface MikeBounds {
   headY: number;
 }
 
+export interface MikeSpeakingOptions {
+  /** Clip to play first for this speech segment (bound to this audio). */
+  preferredAnimationId?: string | null;
+  /** Approximate remaining speech time; fillers stop after this. */
+  estimatedDurationSec?: number;
+  /**
+   * Force the preferred clip even if it matches the last animation id
+   * (explain → talk both use seg_377 must still replay).
+   */
+  forcePreferred?: boolean;
+}
+
 export interface MikeAnimationApi {
   playAnimation(
     animationId: string,
@@ -55,7 +67,9 @@ export interface MikeAnimationApi {
     options?: { repeats?: number; loop?: boolean },
   ): Promise<boolean>;
   playWaiting(): void;
-  setSpeaking(value: boolean): void;
+  prepareSpeech(options?: MikeSpeakingOptions): Promise<boolean>;
+  setSpeaking(value: boolean, options?: MikeSpeakingOptions): void;
+  setPaused(value: boolean): void;
   stop(): void;
   registryRecord(animationId: string): AnimationRecord | null;
   subscribePlayback(listener: (event: PlaybackEvent) => void): () => void;
@@ -67,35 +81,41 @@ interface MikeModelProps {
 }
 
 export const mikeAssets = createVersionedAssetResolver({
-  baseUrl: "/lixia-animation/v1",
+  baseUrl: "/lixia-animation/v2",
 });
 
-const IDLE_ANIMATION_ID = "mixamo_1094";
-const GREETING_ANIMATION_ID = "mixamo_2148";
-const TALK_ANIMATION_ID = "mixamo_602";
+const IDLE_ANIMATION_ID = "mixamo_1193";
+const GREETING_ANIMATION_ID = "mixamo_038";
 
-/**
- * Conversational upper-body clips that keep Mike's hands moving for as
- * long as he is speaking. Short Mixamo/SeG takes are 1–4s; TTS lines are
- * often much longer, so these are chained back-to-back until speech ends.
- */
-const SPEAKING_HAND_IDS = [
-  "seg_377",
-  "seg_373",
-  "seg_456",
-  "seg_388",
-  "seg_492",
-  "seg_413",
-  "seg_001",
-  "seg_055",
+/** Final-approved upper-body gestures blended over the looping neutral idle. */
+const SPEAKING_FILLER_IDS = [
+  "seg_377", // Hands Explain
+  "seg_373", // Hands Emphasis
+  "seg_456", // Palm Offer
+  "seg_388", // Hands Reveal
+  "seg_469", // Palms Balance
+  "seg_481", // Palms Expand
+  "seg_504", // Palms Up Low
+  "seg_369", // Hands Draw Outline
 ] as const;
+
+type PreparedSpeech = {
+  key: string;
+  items: Array<{
+    name: string;
+    animationId: string;
+    repeats: number;
+    fade: number;
+    transitionLeadSeconds: number;
+  }>;
+};
 
 const MODEL_POSITION: [number, number, number] = [-3.1, 0, 0.4];
 const MODEL_ROTATION: [number, number, number] = [0, 0.25, 0];
 
 // Mike's height in scene units. The board layout adapts to the measured
 // bounds, so this only controls his size relative to the studio/camera.
-const SCENE_HEIGHT = 3.4;
+const SCENE_HEIGHT = 4.8;
 
 const FINGER_BONE = /^CC_Base_[LR]_(?:Thumb|Index|Mid|Ring|Pinky)[123]$/;
 const NATURAL_FINGER_STRENGTH = 0.65;
@@ -103,6 +123,43 @@ const UPPER_BODY_BONE =
   /^CC_Base_(?:Spine0[123]|NeckTwist\d+|Head|JawRoot|FacialBone|[LR]_(?:Clavicle|Upperarm.*|Forearm.*|Hand|Thumb\d|Index\d|Mid\d|Ring\d|Pinky\d))$/;
 
 type BodyLayer = "full_body" | "upper_body";
+
+/** Remove only genuinely motionless lead-in/tail frames from gesture clips. */
+function trimStaticGestureEdges(clip: THREE.AnimationClip): THREE.AnimationClip {
+  let firstMotion = clip.duration;
+  let lastMotion = 0;
+
+  for (const track of clip.tracks) {
+    if (!track.name.endsWith(".quaternion") || track.getValueSize() !== 4) continue;
+    const q0 = new THREE.Quaternion();
+    const q1 = new THREE.Quaternion();
+    for (let key = 1; key < track.times.length; key += 1) {
+      q0.fromArray(track.values, (key - 1) * 4).normalize();
+      q1.fromArray(track.values, key * 4).normalize();
+      // Ignore capture jitter; 0.12 degrees between samples is visible motion.
+      if (q0.angleTo(q1) < THREE.MathUtils.degToRad(0.12)) continue;
+      firstMotion = Math.min(firstMotion, track.times[key - 1]);
+      lastMotion = Math.max(lastMotion, track.times[key]);
+    }
+  }
+
+  if (lastMotion <= firstMotion) return clip;
+  const start = Math.max(0, firstMotion - 0.12);
+  const end = Math.min(clip.duration, lastMotion + 0.16);
+  // Small holds are natural. Only remove pauses long enough to look frozen.
+  if (start < 0.3 && clip.duration - end < 0.3) return clip;
+
+  const trimmed = clip.clone();
+  for (const track of trimmed.tracks) {
+    track.trim(start, end);
+    for (let index = 0; index < track.times.length; index += 1) {
+      track.times[index] -= start;
+    }
+  }
+  trimmed.duration = end - start;
+  trimmed.resetDuration();
+  return trimmed;
+}
 
 /** Select real outer bones, not FBXLoader's same-named skin wrappers. */
 function getDrivingBones(root: THREE.Object3D | null): Map<string, THREE.Bone> {
@@ -179,10 +236,12 @@ function toHierarchyClip(
     const target = drivingBones.get(node);
     if (!target) continue;
     const isRootBone = Boolean(target.parent && !(target.parent as THREE.Bone).isBone);
+    const useFingerStrength =
+      layer === "upper_body" ? 1 : fingerStrength;
 
     const next =
-      prop === "quaternion" && FINGER_BONE.test(node) && fingerStrength < 1
-        ? dampQuaternionTrack(track, target.quaternion, fingerStrength)
+      prop === "quaternion" && FINGER_BONE.test(node) && useFingerStrength < 1
+        ? dampQuaternionTrack(track, target.quaternion, useFingerStrength)
         : track.clone();
 
     // FBX clips and the GLB character put the up-axis conversion in different
@@ -218,14 +277,11 @@ function toHierarchyClip(
     tracks.push(next);
   }
   if (!tracks.length) return null;
-  const result = new THREE.AnimationClip(clip.name, clip.duration, tracks);
-  if (layer === "upper_body") {
-    // Upper-body gestures become deltas from their first frame so Three.js
-    // blends them over the base idle instead of replacing the legs.
-    THREE.AnimationUtils.makeClipAdditive(result, 0, result);
-    result.blendMode = THREE.AdditiveAnimationBlendMode;
-  }
-  return result;
+  // Upper-body clips replace only arm/spine/head tracks. Do not convert
+  // them to additive deltas — that stacked on the talk pose and twisted
+  // the arms. Legs stay on the looping idle underneath.
+  const playable = new THREE.AnimationClip(clip.name, clip.duration, tracks);
+  return layer === "upper_body" ? trimStaticGestureEdges(playable) : playable;
 }
 
 function tuneMikeMaterials(root: THREE.Object3D) {
@@ -339,10 +395,8 @@ export default function MikeModel({ onMeasured, onReady }: MikeModelProps) {
   const upperBodyQueueRef = useRef<PlaybackQueue | null>(null);
   const featureRef = useRef<MikeAnimationFeature | null>(null);
   const speakingRef = useRef(false);
-  const handIndexRef = useRef(0);
-  const lastHandIdRef = useRef<string | null>(null);
-  const restoringTalkRef = useRef(false);
-  const handsPendingRef = useRef(false);
+  const speechPreparationTokenRef = useRef(0);
+  const preparedSpeechRef = useRef<PreparedSpeech | null>(null);
   const playToken = useRef(0);
   const upperBodyPlayToken = useRef(0);
   const onMeasuredRef = useRef(onMeasured);
@@ -501,7 +555,16 @@ export default function MikeModel({ onMeasured, onReady }: MikeModelProps) {
         name: string;
         action: THREE.AnimationAction;
       }) => {
-        if (name === "waiting" || name === "wave" || name === "talking") return;
+        // Speech actions are prepared as a complete queue. PlaybackQueue
+        // temporarily retires future actions while crossfading, so keep them
+        // cached until the audio segment ends and cleanup runs.
+        if (
+          name === "waiting" ||
+          name === "wave" ||
+          name.startsWith("speech-")
+        ) {
+          return;
+        }
         if (actions.current[name] !== action) return;
         action.stop();
         mixer.current?.uncacheAction(action.getClip(), modelRef.current ?? undefined);
@@ -522,107 +585,135 @@ export default function MikeModel({ onMeasured, onReady }: MikeModelProps) {
         name: string;
         action: THREE.AnimationAction;
       }) => {
+        // The entire speech sequence is prepared before audio starts. Queue
+        // crossfades temporarily retire future actions, so retain them until
+        // the speech segment completes and cleanup runs.
+        if (name.startsWith("speech-")) return;
         if (upperBodyActions.current[name] !== action) return;
         action.stop();
         mixer.current?.uncacheAction(action.getClip(), modelRef.current ?? undefined);
         delete upperBodyActions.current[name];
       },
     });
-    model.visible = false;
+    model.visible = true;
 
-    function nextSpeakingHandId(preferred?: string | null) {
-      if (preferred && preferred !== lastHandIdRef.current) return preferred;
-      for (let i = 0; i < SPEAKING_HAND_IDS.length; i += 1) {
-        const id =
-          SPEAKING_HAND_IDS[handIndexRef.current % SPEAKING_HAND_IDS.length];
-        handIndexRef.current += 1;
-        if (id !== lastHandIdRef.current) return id;
-      }
-      return SPEAKING_HAND_IDS[0];
+    const speechKey = (options: MikeSpeakingOptions = {}) => {
+      const preferred = options.preferredAnimationId ?? "seg_377";
+      const duration = Math.max(1, options.estimatedDurationSec ?? 3);
+      return `${preferred}:${duration.toFixed(3)}`;
+    };
+
+    function cleanupPreparedSpeechActions() {
+      const active = upperBodyCurrentAction.current;
+
+      Object.entries(upperBodyActions.current).forEach(([name, action]) => {
+        if (!name.startsWith("speech-") || action === active) {
+          return;
+        }
+
+        action.stop();
+        mixer.current?.uncacheAction(
+          action.getClip(),
+          modelRef.current ?? undefined,
+        );
+        delete upperBodyActions.current[name];
+      });
     }
 
-    async function playTalkingLoop() {
-      const feature = featureRef.current;
-      if (!feature || !speakingRef.current) return false;
-      restoringTalkRef.current = true;
-      try {
-        const result = await feature.play({
-          animationId: TALK_ANIMATION_ID,
-          priority: 20,
-          mode: "replace",
-          loop: true,
-        });
-        return result.accepted;
-      } finally {
-        restoringTalkRef.current = false;
-      }
-    }
+    async function prepareSpeechPerformance(
+      options: MikeSpeakingOptions = {},
+    ): Promise<boolean> {
+      const key = speechKey(options);
 
-    async function playSpeakingHands(preferred?: string | null) {
-      const feature = featureRef.current;
-      if (!feature || !speakingRef.current) return false;
-      if (handsPendingRef.current && !preferred) return false;
-      const animationId = nextSpeakingHandId(preferred);
-      lastHandIdRef.current = animationId;
-      handsPendingRef.current = true;
-      try {
-        const result = await feature.gesture({
-          animationId,
-          layer: "upper_body",
-          priority: 40,
-          mode: "replace",
-          repeats: 1,
-        });
-        if (!result.accepted) handsPendingRef.current = false;
-        return result.accepted;
-      } catch (error) {
-        handsPendingRef.current = false;
-        throw error;
+      if (preparedSpeechRef.current?.key === key) {
+        return preparedSpeechRef.current.items.length > 0;
       }
+
+      const preparationToken = ++speechPreparationTokenRef.current;
+      const requestedPreferred = options.preferredAnimationId ?? "seg_377";
+      const preferredRecord = animationRegistry.resolve(requestedPreferred);
+      const preferred =
+        preferredRecord?.presentation_safe !== false &&
+        preferredRecord?.body_layer === "upper_body"
+          ? requestedPreferred
+          : "seg_377";
+      const targetSeconds = Math.max(1, options.estimatedDurationSec ?? 3);
+      const candidates = [
+        preferred,
+        ...SPEAKING_FILLER_IDS.filter((id) => id !== preferred),
+      ];
+      const plannedIds: string[] = [];
+      let coveredSeconds = 0;
+      let candidateIndex = 0;
+
+      while (coveredSeconds < targetSeconds + 0.35 && plannedIds.length < 12) {
+        const animationId = candidates[candidateIndex % candidates.length];
+        plannedIds.push(animationId);
+        const record = animationRegistry.resolve(animationId);
+        coveredSeconds += Math.max(0.5, (record?.duration_seconds ?? 3) - 0.55);
+        candidateIndex += 1;
+      }
+
+      cleanupPreparedSpeechActions();
+
+      const items: PreparedSpeech["items"] = [];
+
+      for (const [index, animationId] of plannedIds.entries()) {
+        const record = animationRegistry.resolve(animationId);
+        if (!record) {
+          console.warn(`Missing Mixamo teaching animation: ${animationId}`);
+          continue;
+        }
+        const name = `speech-${preparationToken}-${index}-${animationId}`;
+        const action = await prepareClip(
+          mikeAssets.resolveAnimation(record),
+          name,
+          "upper_body",
+        );
+
+        if (
+          preparationToken !== speechPreparationTokenRef.current ||
+          cancelled
+        ) {
+          return false;
+        }
+
+        if (action) {
+          items.push({
+            name,
+            animationId,
+            repeats: 1,
+            fade: 0.55,
+            transitionLeadSeconds: 0.55,
+          });
+        }
+      }
+
+      preparedSpeechRef.current = { key, items };
+      return items.length > 0;
     }
 
     function stopSpeakingMotion() {
       speakingRef.current = false;
-      lastHandIdRef.current = null;
-      handsPendingRef.current = false;
+      speechPreparationTokenRef.current += 1;
+      playToken.current += 1;
+      upperBodyPlayToken.current += 1;
       featureRef.current?.setSpeaking(false);
       upperBodyQueueRef.current?.clear({
-        emitInterrupted: false,
+        emitInterrupted: true,
         reason: "idle",
       });
       queueRef.current?.returnToWaiting();
+      preparedSpeechRef.current = null;
+      const cleanupToken = speechPreparationTokenRef.current;
+      window.setTimeout(() => {
+        if (cleanupToken === speechPreparationTokenRef.current) {
+          cleanupPreparedSpeechActions();
+        }
+      }, 400);
     }
 
-    const unsubscribePlayback = featureRef.current.subscribePlayback(
-      (event) => {
-        if (event.layer === "upper_body" && event.state === PLAYBACK_STATES.PLAYING) {
-          handsPendingRef.current = false;
-        }
-
-        if (!speakingRef.current) return;
-
-        if (
-          event.layer === "upper_body" &&
-          (event.state === PLAYBACK_STATES.COMPLETED ||
-            event.state === PLAYBACK_STATES.READY ||
-            event.state === PLAYBACK_STATES.ERROR)
-        ) {
-          void playSpeakingHands();
-        }
-
-        if (
-          event.layer !== "upper_body" &&
-          !restoringTalkRef.current &&
-          (event.state === PLAYBACK_STATES.IDLE ||
-            event.state === PLAYBACK_STATES.COMPLETED ||
-            event.state === PLAYBACK_STATES.READY) &&
-          event.animation_id !== TALK_ANIMATION_ID &&
-          event.action_name !== "talking"
-        ) {
-          void playTalkingLoop();
-        }
-      },
-    );
+    const unsubscribePlayback = featureRef.current.subscribePlayback(() => {});
 
     function buildApi(): MikeAnimationApi {
       const feature = featureRef.current;
@@ -640,32 +731,57 @@ export default function MikeModel({ onMeasured, onReady }: MikeModelProps) {
         },
         playGesture: async (animationId, options = {}) => {
           if (!feature) return false;
-          if (speakingRef.current) {
-            return playSpeakingHands(animationId);
-          }
           const result = await feature.gesture({
             animationId,
-            layer: "upper_body",
             priority: 40,
             mode: "replace",
-            repeats: options.repeats,
+            repeats: options.repeats ?? 1,
             loop: options.loop,
+            layer: "upper_body",
           });
           return result.accepted;
         },
         playWaiting: () => {
-          stopSpeakingMotion();
+          if (speakingRef.current) {
+            stopSpeakingMotion();
+          } else {
+            queueRef.current?.returnToWaiting();
+          }
         },
-        setSpeaking: (value) => {
+        prepareSpeech: prepareSpeechPerformance,
+        setSpeaking: (value, options = {}) => {
           const next = Boolean(value);
           feature?.setSpeaking(next);
-          if (next === speakingRef.current) return;
-          speakingRef.current = next;
-          if (next) {
-            void playTalkingLoop();
-            void playSpeakingHands();
+          if (!next) {
+            if (speakingRef.current) stopSpeakingMotion();
+            return;
+          }
+
+          speakingRef.current = true;
+
+          const startPrepared = () => {
+            if (!speakingRef.current) {
+              return;
+            }
+
+            const prepared = preparedSpeechRef.current;
+            if (!prepared || prepared.key !== speechKey(options)) {
+              queueRef.current?.returnToWaiting();
+              return;
+            }
+
+            upperBodyQueueRef.current?.playNow(prepared.items);
+          };
+
+          if (preparedSpeechRef.current?.key === speechKey(options)) {
+            startPrepared();
           } else {
-            stopSpeakingMotion();
+            void prepareSpeechPerformance(options).then(startPrepared);
+          }
+        },
+        setPaused: (value) => {
+          if (mixer.current) {
+            mixer.current.timeScale = value ? 0 : 1;
           }
         },
         stop: () => {
@@ -683,27 +799,13 @@ export default function MikeModel({ onMeasured, onReady }: MikeModelProps) {
     async function bootPresence() {
       try {
         const idleRecord = animationRegistry.playable(IDLE_ANIMATION_ID);
-        const waveRecord = animationRegistry.playable(GREETING_ANIMATION_ID);
-        const talkRecord = animationRegistry.playable(TALK_ANIMATION_ID);
-        const [wave, waiting] = await Promise.all([
-          prepareClip(mikeAssets.resolveAnimation(waveRecord), "wave"),
-          prepareClip(mikeAssets.resolveAnimation(idleRecord), "waiting"),
-          prepareClip(mikeAssets.resolveAnimation(talkRecord), "talking"),
-          animationClipCache.preload(
-            SPEAKING_HAND_IDS.map((id) =>
-              mikeAssets.resolveAnimation(animationRegistry.playable(id)),
-            ),
-          ),
-        ]);
+        const waiting = await prepareClip(
+          mikeAssets.resolveAnimation(idleRecord),
+          "waiting",
+        );
         if (cancelled || !mixer.current || !model) return;
 
-        model.visible = true;
-        if (wave && waiting) {
-          queueRef.current?.playNow([
-            { name: "wave", animationId: GREETING_ANIMATION_ID, loop: false, fade: 0.15 },
-            { name: "waiting", animationId: IDLE_ANIMATION_ID, loop: true, fade: 0.35 },
-          ]);
-        } else if (waiting) {
+        if (waiting) {
           queueRef.current?.playNow([
             { name: "waiting", animationId: IDLE_ANIMATION_ID, loop: true, fade: 0.2 },
           ]);
@@ -714,6 +816,27 @@ export default function MikeModel({ onMeasured, onReady }: MikeModelProps) {
           (window as unknown as Record<string, unknown>).__lixiaMike = api;
         }
         onReadyRef.current?.(api);
+
+        const waveRecord = animationRegistry.playable(GREETING_ANIMATION_ID);
+        const wave = await prepareClip(
+          mikeAssets.resolveAnimation(waveRecord),
+          "wave",
+        );
+        if (cancelled || !mixer.current) return;
+
+        if (wave && waiting && !speakingRef.current) {
+          queueRef.current?.playNow([
+            { name: "wave", animationId: GREETING_ANIMATION_ID, loop: false, fade: 0.15 },
+            { name: "waiting", animationId: IDLE_ANIMATION_ID, loop: true, fade: 0.35 },
+          ]);
+        }
+
+        void animationClipCache.preload(
+          SPEAKING_FILLER_IDS.flatMap((id) => {
+            const record = animationRegistry.resolve(id);
+            return record ? [mikeAssets.resolveAnimation(record)] : [];
+          }),
+        );
       } catch (error) {
         console.warn("Mike presence boot failed:", error);
         if (model) model.visible = true;

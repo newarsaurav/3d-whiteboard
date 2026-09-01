@@ -1,5 +1,11 @@
 import { GoogleGenAI } from "@google/genai";
 import { NextResponse } from "next/server";
+import {
+  INVALID_GEMINI_KEY_FORMAT,
+  MISSING_GEMINI_KEY,
+  isGeminiApiKeyFormat,
+  readGeminiApiKey,
+} from "../../../lib/geminiAuth";
 
 export const runtime = "nodejs";
 
@@ -13,14 +19,19 @@ const SAMPLE_RATE = 24000;
 
 export async function POST(request: Request) {
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = readGeminiApiKey();
 
     if (!apiKey) {
       return NextResponse.json(
-        {
-          error: "GEMINI_API_KEY is missing from .env.local.",
-        },
+        { error: MISSING_GEMINI_KEY },
         { status: 500 },
+      );
+    }
+
+    if (!isGeminiApiKeyFormat(apiKey)) {
+      return NextResponse.json(
+        { error: INVALID_GEMINI_KEY_FORMAT },
+        { status: 401 },
       );
     }
 
@@ -75,7 +86,7 @@ ${text}
       await ai.models.generateContentStream({
         model:
           process.env.GEMINI_TTS_MODEL ??
-          "gemini-3.1-flash-tts-preview",
+          "gemini-2.5-flash-preview-tts",
         contents: [
           {
             role: "user",
@@ -164,9 +175,14 @@ ${text}
         ? error.message
         : "Gemini could not generate teacher audio.";
 
+    const is429 =
+      message.includes("429") ||
+      message.includes("RESOURCE_EXHAUSTED") ||
+      message.includes("quota");
+
     return NextResponse.json(
       { error: message },
-      { status: 500 },
+      { status: is429 ? 429 : 500 },
     );
   }
 }

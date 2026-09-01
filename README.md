@@ -8,15 +8,15 @@ that follow the lesson narration.
 
 ### What was added
 
-- **`vendor/lixia-mike-animation-0.2.1.tgz`** — the `@lixia/mike-animation`
+- **`vendor/lixia-mike-animation-0.2.3.tgz`** — the `@lixia/mike-animation`
   runtime (animation registry, priority scheduler, crossfades, additive
   upper-body gesture layer, presentation director). It is vendored as a
   tarball so `npm install` works offline with no private registry. It is a
   regular dependency in `package.json`.
-- **`public/lixia-animation/v1/`** — the committed *mobile-core pack*:
-  the character GLB (~29 MB) plus 24 approved animation clips (~45 MB total;
-  7 Mixamo full-body actions and 17 SeG upper-body conversational gestures)
-  with integrity manifests. The full 2,600+ clip library intentionally stays
+- **`public/lixia-animation/v2/`** — the final-approved presentation pack:
+  the character GLB plus 129 approved animation clips (15 Mixamo full-body
+  actions and 114 SeG upper-body conversational gestures) with integrity
+  manifests. The full 2,600+ clip library intentionally stays
   out of git; these 24 cover the whole teaching-gesture vocabulary.
 - **`components/MikeModel.tsx`** — rewritten as the animation bridge. It
   binds baked FBX clips to the GLB skeleton at runtime (unit conversion,

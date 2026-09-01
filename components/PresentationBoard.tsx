@@ -39,16 +39,10 @@ interface PresentationBoardProps {
   // 10 = slow, 100 = fast.
   writingSpeed: number;
   drawingSpeed: number;
-  animationPaused?: boolean;
 
   onDrawingChange: (
     boardId: number,
     drawing: string,
-  ) => void;
-
-  onCommandRenderComplete?: (
-    boardId: number,
-    version: number,
   ) => void;
 
 }
@@ -80,6 +74,19 @@ const HUB_RADIUS = 0.15;
 
 const CANVAS_WIDTH = 1600;
 const CANVAS_HEIGHT = 900;
+// Keep all board layout/drawing math in the original 1600x900 coordinate
+// system, but render into a denser backing store so the texture remains
+// legible when the 3D camera moves close to it.
+const TEXTURE_PIXEL_SCALE = 2;
+
+function getLogicalCanvasSize(canvas: HTMLCanvasElement) {
+  const pixelScale = Number(canvas.dataset.pixelScale) || 1;
+
+  return {
+    width: canvas.width / pixelScale,
+    height: canvas.height / pixelScale,
+  };
+}
 
 function getCylinderTransform(
   start: THREE.Vector3,
@@ -1282,10 +1289,12 @@ function renderBoardCommandToCanvas(
   canvas: HTMLCanvasElement,
   command: BoardCommand,
 ) {
+  const { width, height } = getLogicalCanvasSize(canvas);
+
   context.save();
   context.globalCompositeOperation = "source-over";
   context.fillStyle = BOARD_BACKGROUND;
-  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillRect(0, 0, width, height);
   context.restore();
 
   context.save();
@@ -2302,10 +2311,12 @@ function paintTracedDoodle(
   strokes: TracedStroke[],
   progress: number,
 ) {
+  const { width, height } = getLogicalCanvasSize(canvas);
+
   context.save();
   context.globalCompositeOperation = "source-over";
   context.fillStyle = BOARD_BACKGROUND;
-  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillRect(0, 0, width, height);
   context.restore();
 
   const totalUnits = Math.max(1, countTracedStrokeUnits(strokes));
@@ -2377,11 +2388,12 @@ function paintImageDoodleReveal(
   progress: number,
 ) {
   const safeProgress = Math.min(1, Math.max(0, progress));
+  const { width, height } = getLogicalCanvasSize(canvas);
 
   context.save();
   context.globalCompositeOperation = "source-over";
   context.fillStyle = BOARD_BACKGROUND;
-  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillRect(0, 0, width, height);
   context.restore();
 
   if (
@@ -2399,8 +2411,8 @@ function paintImageDoodleReveal(
       sourceCanvas,
       0,
       0,
-      canvas.width,
-      canvas.height,
+      width,
+      height,
     );
     context.restore();
     return;
@@ -2500,8 +2512,8 @@ function paintImageDoodleReveal(
     plan.revealCanvas,
     0,
     0,
-    canvas.width,
-    canvas.height,
+    width,
+    height,
   );
 }
 
@@ -2528,23 +2540,25 @@ function paintBoardImage(
   canvas: HTMLCanvasElement,
   image: HTMLImageElement,
 ) {
+  const logicalSize = getLogicalCanvasSize(canvas);
+
   context.save();
   context.globalCompositeOperation = "source-over";
   context.fillStyle = BOARD_BACKGROUND;
-  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.fillRect(0, 0, logicalSize.width, logicalSize.height);
 
   // Gemini is requested to return 16:9 images, matching the board.
   // Use contain as a safety net so no part of the generated image is
   // cropped if a model returns a slightly different aspect ratio.
   const scale = Math.min(
-    canvas.width / image.naturalWidth,
-    canvas.height / image.naturalHeight,
+    logicalSize.width / image.naturalWidth,
+    logicalSize.height / image.naturalHeight,
   );
 
   const width = image.naturalWidth * scale;
   const height = image.naturalHeight * scale;
-  const x = (canvas.width - width) / 2;
-  const y = (canvas.height - height) / 2;
+  const x = (logicalSize.width - width) / 2;
+  const y = (logicalSize.height - height) / 2;
 
   context.drawImage(
     image,
@@ -2570,9 +2584,7 @@ export default function PresentationBoard({
   generatedCommandVersion,
   writingSpeed,
   drawingSpeed,
-  animationPaused = false,
   onDrawingChange,
-  onCommandRenderComplete,
 }: PresentationBoardProps) {
   const isDrawingRef = useRef(false);
 
@@ -2593,13 +2605,8 @@ export default function PresentationBoard({
 
   const drawingLoadRunRef = useRef(0);
   const commandRenderRunRef = useRef(0);
-  const animationPausedRef = useRef(animationPaused);
   const writingSpeedRef = useRef(writingSpeed);
   const drawingSpeedRef = useRef(drawingSpeed);
-
-  useEffect(() => {
-    animationPausedRef.current = animationPaused;
-  }, [animationPaused]);
 
   useEffect(() => {
     writingSpeedRef.current = writingSpeed;
@@ -2617,17 +2624,26 @@ export default function PresentationBoard({
     const canvas =
       document.createElement("canvas");
 
-    canvas.width = CANVAS_WIDTH;
-    canvas.height = CANVAS_HEIGHT;
+    canvas.width = CANVAS_WIDTH * TEXTURE_PIXEL_SCALE;
+    canvas.height = CANVAS_HEIGHT * TEXTURE_PIXEL_SCALE;
+    canvas.dataset.pixelScale = String(TEXTURE_PIXEL_SCALE);
 
     return canvas;
   }, []);
 
   const context = useMemo(() => {
-    return (
-      drawingCanvas?.getContext("2d") ??
-      null
+    const drawingContext = drawingCanvas?.getContext("2d") ?? null;
+
+    drawingContext?.setTransform(
+      TEXTURE_PIXEL_SCALE,
+      0,
+      0,
+      TEXTURE_PIXEL_SCALE,
+      0,
+      0,
     );
+
+    return drawingContext;
   }, [drawingCanvas]);
 
   const texture = useMemo(() => {
@@ -2684,8 +2700,8 @@ export default function PresentationBoard({
       context.fillRect(
         0,
         0,
-        drawingCanvas.width,
-        drawingCanvas.height,
+        CANVAS_WIDTH,
+        CANVAS_HEIGHT,
       );
 
       context.restore();
@@ -2725,7 +2741,6 @@ export default function PresentationBoard({
       command: BoardCommand,
       targetBoardId: number,
       renderRun: number,
-      commandVersion: number,
     ) => {
       if (!drawingCanvas || !context) {
         return;
@@ -2742,6 +2757,7 @@ export default function PresentationBoard({
         return new Promise((resolve) => {
           let accumulated = 0;
           let lastTimestamp: number | null = null;
+          let lastPaintTimestamp = -Infinity;
 
           const frame = (timestamp: number) => {
             if (isCancelled()) {
@@ -2756,18 +2772,21 @@ export default function PresentationBoard({
             const delta = Math.min(50, timestamp - lastTimestamp);
             lastTimestamp = timestamp;
 
-            // Pausing voice also pauses the board-writing clock.
-            if (!animationPausedRef.current) {
-              accumulated += delta;
-            }
+            accumulated += delta;
 
             const progress = Math.min(
               1,
               accumulated / Math.max(1, durationMs),
             );
 
-            drawFrame(progress);
-            refreshTexture();
+            // Uploading this 3200x1800 canvas every display frame competes
+            // with Mike's mixer. The board streams independently at 12.5fps
+            // while the character keeps the full display frame rate.
+            if (progress >= 1 || timestamp - lastPaintTimestamp >= 80) {
+              drawFrame(progress);
+              refreshTexture();
+              lastPaintTimestamp = timestamp;
+            }
 
             if (progress >= 1) {
               resolve(true);
@@ -2792,14 +2811,14 @@ export default function PresentationBoard({
 
         const fittedImage = createFittedImageCanvas(
           image,
-          drawingCanvas.width,
-          drawingCanvas.height,
+          CANVAS_WIDTH,
+          CANVAS_HEIGHT,
         );
 
         const doodleRevealPlan =
           buildDoodleRevealPlan(fittedImage);
 
-        const duration = command.style === "doodle"
+        const naturalDuration = command.style === "doodle"
           ? Math.min(
               9500,
               Math.max(
@@ -2820,7 +2839,7 @@ export default function PresentationBoard({
             );
 
         completed = await animate(
-          duration,
+          naturalDuration,
           (progress) => {
             paintImageDoodleReveal(
               context,
@@ -2837,13 +2856,13 @@ export default function PresentationBoard({
           countTextCommandCharacters(command),
         );
 
-        const duration = Math.min(
+        const naturalDuration = Math.min(
           30000,
           Math.max(450, characterCount * writingDelayMs(writingSpeedRef.current)),
         );
 
         completed = await animate(
-          duration,
+          naturalDuration,
           (progress) => {
             const visibleCharacters = Math.ceil(
               characterCount * progress,
@@ -2864,13 +2883,13 @@ export default function PresentationBoard({
           Math.max(1, command.nodes.length) * 1.25 +
           Math.max(1, command.edges.length) * 0.8;
 
-        const duration = Math.min(
+        const naturalDuration = Math.min(
           24000,
           1000 + drawingUnitMs(drawingSpeedRef.current) * complexity,
         );
 
         completed = await animate(
-          duration,
+          naturalDuration,
           (progress) => {
             renderBoardCommandToCanvas(
               context,
@@ -2884,7 +2903,7 @@ export default function PresentationBoard({
         );
       } else {
         const dataCount = Math.max(1, command.data.length);
-        const duration = Math.min(
+        const naturalDuration = Math.min(
           18000,
           1100 +
             drawingUnitMs(drawingSpeedRef.current) *
@@ -2893,7 +2912,7 @@ export default function PresentationBoard({
         );
 
         completed = await animate(
-          duration,
+          naturalDuration,
           (progress) => {
             renderBoardCommandToCanvas(
               context,
@@ -2942,17 +2961,12 @@ export default function PresentationBoard({
         finishedDrawing,
       );
 
-      onCommandRenderComplete?.(
-        targetBoardId,
-        commandVersion,
-      );
     },
     [
       drawingCanvas,
       context,
       refreshTexture,
       onDrawingChange,
-      onCommandRenderComplete,
     ],
   );
 
@@ -3010,8 +3024,8 @@ export default function PresentationBoard({
     context.fillRect(
       0,
       0,
-      drawingCanvas.width,
-      drawingCanvas.height,
+      CANVAS_WIDTH,
+      CANVAS_HEIGHT,
     );
     context.restore();
 
@@ -3039,16 +3053,16 @@ export default function PresentationBoard({
       context.fillRect(
         0,
         0,
-        drawingCanvas.width,
-        drawingCanvas.height,
+        CANVAS_WIDTH,
+        CANVAS_HEIGHT,
       );
 
       context.drawImage(
         image,
         0,
         0,
-        drawingCanvas.width,
-        drawingCanvas.height,
+        CANVAS_WIDTH,
+        CANVAS_HEIGHT,
       );
       context.restore();
 
@@ -3141,7 +3155,6 @@ export default function PresentationBoard({
       generatedCommand,
       boardId,
       renderRun,
-      generatedCommandVersion,
     ).catch((error) => {
       console.error(
         "Could not render whiteboard command:",
@@ -3246,11 +3259,11 @@ export default function PresentationBoard({
     return {
       x:
         event.uv.x *
-        drawingCanvas.width,
+        CANVAS_WIDTH,
 
       y:
         (1 - event.uv.y) *
-        drawingCanvas.height,
+        CANVAS_HEIGHT,
     };
   }
 

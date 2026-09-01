@@ -109,4 +109,5 @@ export interface Board {
   // onto the same 1600x900 board canvas.
   generatedCommand: BoardCommand | null;
   generatedCommandVersion: number;
+
 }
