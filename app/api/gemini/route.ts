@@ -13,6 +13,7 @@ import type {
   BoardImageCommand,
   BoardManagementCommand,
   BoardTextCommand,
+  FontFamily,
   TeacherLessonCommand,
   FlowchartEdge,
   FlowchartNode,
@@ -87,6 +88,44 @@ const writeTextDeclaration: FunctionDeclaration = {
         type: "string",
         description:
           "Optional one-line takeaway, worked example, or important note.",
+      },
+      font: {
+        type: "string",
+        enum: ["sans-serif", "serif", "monospace", "handwriting", "cursive"],
+        description:
+          "Font family for the text. Default is sans-serif. Available fonts: sans-serif, serif, monospace, handwriting, cursive.",
+      },
+      backgroundColor: {
+        type: "string",
+        description: "Optional six-digit hex background color for the whole whiteboard, such as #fff7ed.",
+      },
+      titleColor: {
+        type: "string",
+        description: "Optional six-digit hex color for the title ONLY (e.g., #FF0000 for red). For coloring specific words within the title, use inline [color=#RRGGBB]markers[/color] in the title string instead.",
+      },
+      textColor: {
+        type: "string",
+        description: "Optional six-digit hex color for ALL bullets and notes (e.g., #0000FF for blue). For coloring specific words, use inline [color=#RRGGBB]markers[/color] in the text strings instead.",
+      },
+      bold: {
+        type: "boolean",
+        description: "Make ALL board text bold when true. For bolding specific words, use **inline markers** in the text strings instead.",
+      },
+      italic: {
+        type: "boolean",
+        description: "Make ALL board text italic when true. For italicizing specific words, use *inline markers* in the text strings instead.",
+      },
+      underline: {
+        type: "boolean",
+        description: "Underline ALL board text when true. For underlining specific words, use __inline markers__ in the text strings instead.",
+      },
+      writingSpeed: {
+        type: "number",
+        description: "Optional writing animation speed from 10 (slow) to 100 (fast).",
+      },
+      drawingSpeed: {
+        type: "number",
+        description: "Optional drawing animation speed from 10 (slow) to 100 (fast).",
       },
     },
     required: ["title", "bullets"],
@@ -181,6 +220,14 @@ const teachLessonDeclaration: FunctionDeclaration = {
               description:
                 "Optional worked example, key takeaway, or short teacher note visible on the board.",
             },
+              backgroundColor: { type: "string", description: "Optional six-digit hex background color." },
+              titleColor: { type: "string", description: "Optional six-digit hex title color." },
+              textColor: { type: "string", description: "Optional six-digit hex bullet and note color." },
+              bold: { type: "boolean", description: "Make board text bold." },
+              italic: { type: "boolean", description: "Make board text italic." },
+              underline: { type: "boolean", description: "Underline board text." },
+              writingSpeed: { type: "number", description: "Writing speed from 10 (slow) to 100 (fast)." },
+              drawingSpeed: { type: "number", description: "Drawing speed from 10 (slow) to 100 (fast)." },
             gesture: {
               type: "string",
               enum: [
@@ -412,6 +459,32 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function readTextFormatting(
+  args: Record<string, unknown>,
+): BoardTextCommand["formatting"] {
+  const hexColor = (value: unknown): string | undefined => {
+    const color = readString(value, "", 7);
+    return /^#[0-9a-f]{6}$/i.test(color) ? color : undefined;
+  };
+
+  const formatting = {
+    ...(hexColor(args.backgroundColor) ? { backgroundColor: hexColor(args.backgroundColor) } : {}),
+    ...(hexColor(args.titleColor) ? { titleColor: hexColor(args.titleColor) } : {}),
+    ...(hexColor(args.textColor) ? { textColor: hexColor(args.textColor) } : {}),
+    ...(args.bold === true ? { bold: true } : {}),
+    ...(args.italic === true ? { italic: true } : {}),
+    ...(args.underline === true ? { underline: true } : {}),
+  };
+
+  return Object.keys(formatting).length > 0 ? formatting : undefined;
+}
+
+function readSpeed(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.round(Math.min(100, Math.max(10, value)))
+    : undefined;
+}
+
 function buildTextCommand(
   args: Record<string, unknown>,
 ): BoardTextCommand {
@@ -433,6 +506,14 @@ function buildTextCommand(
 
   const note = readString(args.note, "", 220);
 
+  const rawFont = readString(args.font, "", 20).toLowerCase();
+  const validFonts: FontFamily[] = ["sans-serif", "serif", "monospace", "handwriting", "cursive"];
+  const font = validFonts.includes(rawFont as FontFamily)
+    ? (rawFont as FontFamily)
+    : undefined;
+
+  const formatting = readTextFormatting(args);
+
   return {
     type: "write_text",
     title,
@@ -442,6 +523,10 @@ function buildTextCommand(
         : ["No whiteboard content was returned."],
     ...(formulas.length > 0 ? { formulas } : {}),
     ...(note ? { note } : {}),
+    ...(font ? { font } : {}),
+    ...(formatting ? { formatting } : {}),
+    ...(readSpeed(args.writingSpeed) !== undefined ? { writingSpeed: readSpeed(args.writingSpeed) } : {}),
+    ...(readSpeed(args.drawingSpeed) !== undefined ? { drawingSpeed: readSpeed(args.drawingSpeed) } : {}),
   };
 }
 
@@ -483,6 +568,7 @@ function buildTeacherLessonCommand(
         : [];
 
       const note = readString(segment.note, "", 220);
+      const formatting = readTextFormatting(segment);
 
       const gesture = readString(segment.gesture, "", 24)
         .toLowerCase();
@@ -507,6 +593,9 @@ function buildTeacherLessonCommand(
                 ],
           ...(formulas.length > 0 ? { formulas } : {}),
           ...(note ? { note } : {}),
+          ...(formatting ? { formatting } : {}),
+          ...(readSpeed(segment.writingSpeed) !== undefined ? { writingSpeed: readSpeed(segment.writingSpeed) } : {}),
+          ...(readSpeed(segment.drawingSpeed) !== undefined ? { drawingSpeed: readSpeed(segment.drawingSpeed) } : {}),
         },
       };
     })
@@ -1116,6 +1205,38 @@ BOARD CONTEXT:
 - For formulas, put symbolic notation on the board, but phrase the narration naturally. Example: board shows "a = Δv / Δt" while narration says "acceleration equals change in velocity divided by change in time."
 - Prefer 3-5 lesson segments so the learner sees the board develop step by step.
 - For teach_lesson, give every segment a gesture that matches its narration. Vary the gestures across the lesson: typically open with welcome/ready, use explain/point/emphasize in the middle, and end with approve/goodbye. Do not repeat the same gesture in consecutive segments unless it clearly fits.
+
+FONT MANAGEMENT:
+- Default font is "sans-serif" - a clean, modern font suitable for most content.
+- When the user asks to change the font, use the "font" parameter in write_text with one of these options:
+  * "sans-serif" - Clean, modern, default font (Segoe UI, Arial)
+  * "serif" - Traditional, formal font (Georgia, Times New Roman)
+  * "monospace" - Fixed-width font for code or technical content (Courier New)
+  * "handwriting" - Playful, handwritten style (Lixia Handwriting, Comic Sans MS)
+  * "cursive" - Elegant, flowing script font (Brush Script MT)
+- When changing fonts, return the complete updated board content with all existing text and the new font applied.
+- If the user asks what fonts are available, use write_text to show them this list.
+
+TEXT FORMATTING AND COLORS:
+- SELECTIVE/PARTIAL FORMATTING: When the user asks to format specific words, phrases, or parts (e.g., "underline the title", "color the word 'gold' red", "italicize some bullets"), use INLINE formatting markers within the text strings:
+  * **bold text** for bold
+  * *italic text* for italic
+  * __underlined text__ for underline
+  * [color=#RRGGBB]colored text[/color] for colors (use six-digit hex, e.g., #FF0000 for red)
+  * Examples: "__What is Gold__" or "[color=#FF0000]important[/color]"
+  * DO NOT use the global titleColor, textColor, or formatting boolean parameters for selective formatting.
+- UNIFORM/FULL-BOARD FORMATTING: When the user asks to format ALL text uniformly (e.g., "make everything bold", "make the entire board italic"), use the global parameters:
+  * bold, italic, underline boolean flags apply to all board text
+  * backgroundColor applies to the entire board background
+  * titleColor applies to the title only
+  * textColor applies to all bullets and notes
+- Always embed inline formatting markers directly in the text (title, bullets, formulas, note) when doing selective formatting.
+- For follow-up formatting requests, return the complete updated content and preserve existing formatting and colors unless the user asks to replace them.
+
+ANIMATION SPEED:
+- Users can control how quickly Lixia writes or draws through prompts. Set writingSpeed and/or drawingSpeed from 10 (slow) to 100 (fast).
+- Interpret slow, slowly, deliberate, and careful as lower values; fast, quickly, rapid, and hurry as higher values.
+- When the user changes only speed, return the complete current board content and preserve its formatting, colors, and text.
 
 Current structured board content:
 ${currentCommand}

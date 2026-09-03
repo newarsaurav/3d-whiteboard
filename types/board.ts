@@ -3,6 +3,32 @@ export type FlowchartNodeShape =
   | "diamond"
   | "circle";
 
+export type FontFamily =
+  | "sans-serif"
+  | "serif"
+  | "monospace"
+  | "handwriting"
+  | "cursive";
+
+export const AVAILABLE_FONTS: Record<FontFamily, string> = {
+  "sans-serif": '"Segoe UI", "Arial", sans-serif',
+  "serif": '"Georgia", "Times New Roman", serif',
+  "monospace": '"Courier New", monospace',
+  "handwriting": '"Lixia Handwriting", "Comic Sans MS", cursive',
+  "cursive": '"Brush Script MT", cursive',
+};
+
+export const DEFAULT_FONT: FontFamily = "sans-serif";
+
+export interface BoardTextFormatting {
+  backgroundColor?: string;
+  titleColor?: string;
+  textColor?: string;
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+}
+
 export interface FlowchartNode {
   id: string;
   label: string;
@@ -23,6 +49,10 @@ export interface BoardTextCommand {
   bullets: string[];
   formulas?: string[];
   note?: string;
+  font?: FontFamily;
+  formatting?: BoardTextFormatting;
+  writingSpeed?: number;
+  drawingSpeed?: number;
 }
 
 export interface TeacherLessonSegment {

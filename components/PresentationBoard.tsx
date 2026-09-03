@@ -16,6 +16,13 @@ import type {
   BoardFlowchartCommand,
   BoardImageCommand,
   BoardTextCommand,
+  BoardTextFormatting,
+  FontFamily,
+} from "@/types/board";
+
+import {
+  AVAILABLE_FONTS,
+  DEFAULT_FONT,
 } from "@/types/board";
 
 export type DrawingTool = "pen" | "eraser";
@@ -327,6 +334,109 @@ function drawCenteredWrappedText(
   });
 }
 
+function getFontString(
+  font: FontFamily | undefined,
+  weight: "400" | "600",
+  sizeInPx: number,
+): string {
+  const fontFamily = font || DEFAULT_FONT;
+  const fontStack = AVAILABLE_FONTS[fontFamily];
+  return `${weight} ${sizeInPx}px ${fontStack}`;
+}
+
+type StyledTextToken = {
+  text: string;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  color?: string;
+};
+
+function parseStyledText(
+  text: string,
+  formatting: BoardTextFormatting | undefined,
+): StyledTextToken[] {
+  const tokens: StyledTextToken[] = [];
+  const markerPattern = /(\*\*|__|\*|_|\[color=#[0-9a-fA-F]{6}\]|\[\/color\])/g;
+  let bold = formatting?.bold ?? false;
+  let italic = formatting?.italic ?? false;
+  let underline = formatting?.underline ?? false;
+  let color = formatting?.textColor;
+  let cursor = 0;
+
+  for (const match of text.matchAll(markerPattern)) {
+    const marker = match[0];
+    const index = match.index ?? 0;
+    if (index > cursor) {
+      tokens.push({ text: text.slice(cursor, index), bold, italic, underline, color });
+    }
+    if (marker === "**") bold = !bold;
+    else if (marker === "__") underline = !underline;
+    else if (marker === "*") italic = !italic;
+    else if (marker === "_") underline = !underline;
+    else if (marker === "[/color]") color = formatting?.textColor;
+    else color = marker.slice(7, -1);
+    cursor = index + marker.length;
+  }
+
+  if (cursor < text.length) {
+    tokens.push({ text: text.slice(cursor), bold, italic, underline, color });
+  }
+  return tokens.length > 0 ? tokens : [{ text: "", bold, italic, underline, color }];
+}
+
+function drawStyledWrappedText(
+  context: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  maxWidth: number,
+  lineHeight: number,
+  sizeInPx: number,
+  weight: "400" | "600",
+  font: FontFamily | undefined,
+  formatting: BoardTextFormatting | undefined,
+  maxLines: number,
+): number {
+  const tokens = parseStyledText(text, formatting);
+  const lines: StyledTextToken[][] = [[]];
+  let lineWidth = 0;
+
+  const tokenFont = (token: StyledTextToken) =>
+    `${token.italic ? "italic " : ""}${token.bold ? "600" : weight} ${sizeInPx}px ${AVAILABLE_FONTS[font || DEFAULT_FONT]}`;
+
+  for (const token of tokens) {
+    for (const part of token.text.split(/(\s+)/).filter(Boolean)) {
+      context.font = tokenFont(token);
+      const partWidth = context.measureText(part).width;
+      if (lineWidth > 0 && lineWidth + partWidth > maxWidth && !/^\s+$/.test(part)) {
+        lines.push([]);
+        lineWidth = 0;
+      }
+      lines[lines.length - 1].push({ ...token, text: part });
+      lineWidth += partWidth;
+    }
+  }
+
+  const visibleLines = lines.slice(0, maxLines);
+  context.textAlign = "left";
+  context.textBaseline = "top";
+  visibleLines.forEach((line, lineIndex) => {
+    let offsetX = x;
+    for (const token of line) {
+      context.font = tokenFont(token);
+      context.fillStyle = token.color || formatting?.textColor || BOARD_INK;
+      context.fillText(token.text, offsetX, y + lineIndex * lineHeight);
+      const width = context.measureText(token.text).width;
+      if (token.underline && token.text.trim()) {
+        context.fillRect(offsetX, y + lineIndex * lineHeight + sizeInPx + 3, width, 2);
+      }
+      offsetX += width;
+    }
+  });
+  return visibleLines.length;
+}
+
 function renderTextCommand(
   context: CanvasRenderingContext2D,
   command: BoardTextCommand,
@@ -339,9 +449,9 @@ function renderTextCommand(
     large: 1.2,
   }[textSize];
 
-  context.fillStyle = "#312e81";
-  context.font =
-    `600 ${64 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
+  const formatting = command.formatting;
+  context.fillStyle = formatting?.titleColor || "#312e81";
+  context.font = getFontString(command.font, "600", 64 * sizeScale);
   context.textAlign = "left";
   context.textBaseline = "top";
 
@@ -352,26 +462,25 @@ function renderTextCommand(
   ).slice(0, 2);
 
   titleLines.forEach((line, index) => {
-    context.fillText(
-      line,
-      marginX,
-      62 + index * 72 * sizeScale,
+    drawStyledWrappedText(
+      context, line, marginX, 62 + index * 72 * sizeScale,
+      CANVAS_WIDTH - marginX * 2, 72 * sizeScale, 64 * sizeScale,
+      "600", command.font, { ...formatting, textColor: formatting?.titleColor }, 1,
     );
   });
 
   let currentY =
     62 + Math.max(1, titleLines.length) * 78 * sizeScale + 24;
 
-  context.fillStyle = BOARD_INK;
-  context.font =
-    `400 ${42 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
+  context.fillStyle = formatting?.textColor || BOARD_INK;
+  context.font = getFontString(
+    command.font,
+    "400",
+    42 * sizeScale,
+  );
 
   for (const bullet of command.bullets.slice(0, 8)) {
-    const lines = getWrappedLines(
-      context,
-      bullet,
-      CANVAS_WIDTH - 250,
-    );
+    const lines = getWrappedLines(context, bullet.replace(/\*\*|__|\*|_|\[color=#[0-9a-fA-F]{6}\]|\[\/color\]/g, ""), CANVAS_WIDTH - 250);
 
     if (currentY + lines.length * 54 * sizeScale > 760) {
       break;
@@ -387,13 +496,10 @@ function renderTextCommand(
     );
     context.fill();
 
-    lines.forEach((line, index) => {
-      context.fillText(
-        line,
-        marginX + 42,
-        currentY + index * 54 * sizeScale,
-      );
-    });
+    drawStyledWrappedText(
+      context, bullet, marginX + 42, currentY, CANVAS_WIDTH - 250,
+      54 * sizeScale, 42 * sizeScale, "400", command.font, formatting, lines.length,
+    );
 
     currentY += Math.max(1, lines.length) * 54 * sizeScale + 18;
   }
@@ -402,8 +508,11 @@ function renderTextCommand(
     context.save();
 
     context.fillStyle = "#4338ca";
-    context.font =
-      `600 ${30 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
+    context.font = getFontString(
+      command.font,
+      "600",
+      30 * sizeScale,
+    );
     context.fillText("Formula", marginX, currentY + 2);
 
     currentY += 48 * sizeScale;
@@ -432,8 +541,11 @@ function renderTextCommand(
       context.stroke();
 
       context.fillStyle = "#1e1b4b";
-      context.font =
-        `600 ${46 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
+      context.font = getFontString(
+        command.font,
+        "600",
+        46 * sizeScale,
+      );
       context.textAlign = "left";
       context.textBaseline = "middle";
       context.fillText(
@@ -468,9 +580,12 @@ function renderTextCommand(
     context.fill();
     context.stroke();
 
-    context.fillStyle = "#3730a3";
-    context.font =
-      `600 ${32 * sizeScale}px "Lixia Handwriting", "Comic Sans MS", cursive`;
+    context.fillStyle = formatting?.textColor || "#3730a3";
+    context.font = getFontString(
+      command.font,
+      "600",
+      32 * sizeScale,
+    );
     context.textBaseline = "middle";
 
     const noteLines = getWrappedLines(
@@ -1293,7 +1408,9 @@ function renderBoardCommandToCanvas(
 ) {
   context.save();
   context.globalCompositeOperation = "source-over";
-  context.fillStyle = BOARD_BACKGROUND;
+  context.fillStyle = command.type === "write_text"
+    ? command.formatting?.backgroundColor || BOARD_BACKGROUND
+    : BOARD_BACKGROUND;
   context.fillRect(0, 0, canvas.width, canvas.height);
   context.restore();
 

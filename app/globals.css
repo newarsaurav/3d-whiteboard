@@ -1179,8 +1179,8 @@ input {
 }
 
 .assistant-message {
-  max-height: 190px;
-  overflow-y: auto;
+  max-height: none;
+  overflow: visible;
 }
 
 @font-face {

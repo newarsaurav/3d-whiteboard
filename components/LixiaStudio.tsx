@@ -995,6 +995,13 @@ export default function LixiaStudio() {
           ),
         );
 
+        if (segment.board.writingSpeed !== undefined) {
+          setWritingSpeed(segment.board.writingSpeed);
+        }
+        if (segment.board.drawingSpeed !== undefined) {
+          setDrawingSpeed(segment.board.drawingSpeed);
+        }
+
 
         await new Promise<void>((resolve) => {
           window.setTimeout(resolve, 180);
@@ -1326,6 +1333,15 @@ export default function LixiaStudio() {
         );
 
         return;
+      }
+
+      if (command.type === "write_text") {
+        if (command.writingSpeed !== undefined) {
+          setWritingSpeed(command.writingSpeed);
+        }
+        if (command.drawingSpeed !== undefined) {
+          setDrawingSpeed(command.drawingSpeed);
+        }
       }
 
       // Keep earlier text answers visible when the active board has room.
