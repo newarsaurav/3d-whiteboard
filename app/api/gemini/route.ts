@@ -60,7 +60,7 @@ const MAX_CONTEXT_LENGTH = 18000;
 const writeTextDeclaration: FunctionDeclaration = {
   name: "write_text",
   description:
-    "Write a concise explanation, definition, lesson, or bullet-point answer on the whiteboard. Use this for theory and factual explanations. For a follow-up edit to existing text, return the COMPLETE updated text content, not only the change.",
+    "Write concise key points on the whiteboard for a short factual answer or when the user explicitly asks for text only/on the board. For explanations, teaching, or help understanding a concept, use teach_lesson so the voice gives the fuller explanation while the board shows only the important points. For a follow-up edit to existing text, return the COMPLETE updated text content, not only the change.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -190,14 +190,14 @@ const teachLessonDeclaration: FunctionDeclaration = {
       segments: {
         type: "array",
         description:
-          "Two to six sequential teaching segments. Each segment contains natural spoken narration and the COMPLETE cumulative board state that should be visible while that narration is spoken.",
+          "Two to six sequential teaching segments. Each segment contains fuller natural spoken narration for the teacher's explanation and the COMPLETE cumulative board state containing only the important points visible while that narration is spoken.",
         items: {
           type: "object",
           properties: {
             narration: {
               type: "string",
               description:
-                "Natural teacher-style speech, usually 1-4 sentences. Explain symbols in spoken words instead of reading raw notation awkwardly.",
+                "Natural teacher-style speech, usually 2-5 sentences. Explain the idea, connect it to the board points, and use a simple example when useful. Do not merely read the board word-for-word. Explain symbols in spoken words instead of reading raw notation awkwardly.",
             },
             boardTitle: {
               type: "string",
@@ -206,7 +206,7 @@ const teachLessonDeclaration: FunctionDeclaration = {
             boardBullets: {
               type: "array",
               description:
-                "Complete cumulative short bullet list visible at this point in the lesson.",
+                "Complete cumulative list of only the important short points visible at this point in the lesson. Keep the board concise; put the fuller explanation in narration.",
               items: { type: "string" },
             },
             formulas: {
@@ -1033,7 +1033,8 @@ Rules:
 - Compose the subject clearly with comfortable margins so it looks good on a whiteboard.
 - Keep the subject large enough and visually simple enough to remain recognizable after whiteboard rendering.
 - Avoid unnecessary text, labels, frames, watermarks, or captions.
-- Use a clean neutral/light background when the user does not specify a setting.
+- When the user does not explicitly request a background, setting, environment, or scene, draw only the requested subject as an isolated doodle on the plain whiteboard background. Do not add scenery, ground, sky, shadows, props, or decorative background elements.
+- Include a background or setting only when the user's request explicitly names one, and then show only the requested subject together with that requested background.
 - Return only the generated image.
       `.trim();
 
@@ -1180,8 +1181,9 @@ You MUST call exactly one available function.
 Do not answer with normal prose.
 
 ROUTING RULES:
-- write_text: short definitions, concise factual answers, or brief explanations that do NOT need a spoken lesson.
-- teach_lesson: detailed explanations, teaching, walkthroughs, formulas, worked examples, or when the user says explain/teach/help me understand. It should sound like a real teacher while the board progressively fills in.
+- teach_lesson: any request to explain, teach, learn, understand, walk through, define a concept, solve a problem, or give a lesson. The voice must give the fuller teacher-style explanation and the board must progressively show only the important points, definitions, formulas, and examples.
+- Use teach_lesson by default for educational questions, even when the user asks a short definition, unless they explicitly ask for a brief answer, text only, or board-only response.
+- write_text: short direct answers or concise key points when the user explicitly wants a brief answer, text only, or board-only content. Do not use it for a teaching explanation when narration would help.
 - draw_flowchart: flowcharts, workflows, processes, decision trees, sequences with arrows.
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
 - generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
@@ -1191,6 +1193,7 @@ ROUTING RULES:
 BOARD CONTEXT:
 - The current structured board content is included below.
 - A current board screenshot may also be attached for follow-up context.
+- When a current board screenshot is attached, inspect it before answering. Pay attention to the user's hand-drawn circles, underlines, highlights, arrows, marks, and the object or text those marks point to. If the user asks what is inside, what something is, or what they pointed to, answer from the attached board image rather than guessing from structured text alone.
 - If the user says "it", "that", "this chart", "add", "change", "remove", "make it a bar chart", etc., use the existing board context and return the COMPLETE updated content through the appropriate tool.
 - If the user asks a clearly unrelated new question, replace the old topic with the new content.
 - Keep whiteboard content concise and readable.
@@ -1201,7 +1204,8 @@ BOARD CONTEXT:
 - Default image style should be a whiteboard doodle / marker sketch. Only choose realistic/photo style when the user clearly asks for it.
 - Use edit_board_image only when the request refers to visual content already on the current board.
 - For teach_lesson, make every segment board state cumulative: later segments must keep useful content/formulas from earlier segments while adding the next idea.
-- Keep teach_lesson narration conversational and more detailed than the board. The board is the concise visual summary; narration is the fuller explanation.
+- Keep teach_lesson narration conversational and substantially more detailed than the board. The voice should explain reasoning and examples like a teacher, not read the board word-for-word. The board is a concise visual summary containing only important information.
+- Keep each lesson board segment to roughly 3-6 short bullets plus only the most important formulas or note. Put supporting detail, transitions, and examples in narration.
 - For formulas, put symbolic notation on the board, but phrase the narration naturally. Example: board shows "a = Δv / Δt" while narration says "acceleration equals change in velocity divided by change in time."
 - Prefer 3-5 lesson segments so the learner sees the board develop step by step.
 - For teach_lesson, give every segment a gesture that matches its narration. Vary the gestures across the lesson: typically open with welcome/ready, use explain/point/emphasize in the middle, and end with approve/goodbye. Do not repeat the same gesture in consecutive segments unless it clearly fits.

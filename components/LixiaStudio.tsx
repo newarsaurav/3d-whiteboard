@@ -109,54 +109,6 @@ function InitialCameraSetup() {
   return null;
 }
 
-function looksLikeBoardFollowUp(
-  prompt: string,
-): boolean {
-  const normalized = prompt.toLowerCase();
-
-  const markers = [
-    "add ",
-    "change ",
-    "update ",
-    "remove ",
-    "delete ",
-    "move ",
-    "replace ",
-    "edit ",
-    "keep ",
-    "make it",
-    "make this",
-    "make that",
-    "make the ",
-    "this ",
-    "that ",
-    " it ",
-    "same ",
-    "above",
-    "below",
-    "beside",
-    "next to",
-    "on the side",
-    "bigger",
-    "smaller",
-    "left",
-    "right",
-    "the chart",
-    "the graph",
-    "the flowchart",
-    "the diagram",
-    "the board",
-    "the cat",
-    "the dog",
-    "the image",
-    "the picture",
-  ];
-
-  return markers.some((marker) =>
-    normalized.includes(marker),
-  );
-}
-
 function getBoardImageForGemini(
   board: Board | undefined,
 ): string | null {
@@ -251,6 +203,22 @@ function appendTextCommand(
     note: [currentCommand.note, nextCommand.note]
       .filter((note): note is string => Boolean(note?.trim()))
       .join(" "),
+  };
+}
+
+function appendLessonToTextCommand(
+  currentCommand: Extract<BoardCommand, { type: "write_text" }>,
+  lesson: TeacherLessonCommand,
+): TeacherLessonCommand {
+  return {
+    ...lesson,
+    segments: lesson.segments.map((segment) => ({
+      ...segment,
+      board: appendTextCommand(
+        currentCommand,
+        segment.board,
+      ),
+    })),
   };
 }
 
@@ -1226,25 +1194,17 @@ export default function LixiaStudio() {
     }
 
     /*
-     * Sending a 1600x900 PNG on every request adds latency.
-     * For most text/chart requests, only attach it when the prompt
-     * looks like a follow-up.
-     *
-     * Important exception: if the current board already contains an
-     * AI-generated image, always provide an image context source.
-     * Otherwise requests such as "make the dog smaller" may route to
-     * edit_board_image without an actual image to edit.
-     *
      * If the board snapshot has not been saved yet, fall back to the
-     * current generated image data URL.
+     * current generated image data URL. Otherwise always attach the
+     * snapshot so Gemini can answer questions about user-drawn marks.
      */
     const boardImageForGemini =
       getBoardImageForGemini(targetBoard);
 
-    const sendBoardImage =
-      Boolean(boardImageForGemini) &&
-      (looksLikeBoardFollowUp(prompt) ||
-        targetBoard.generatedCommand?.type === "image");
+    // The board snapshot is visual context, not only edit context. Send it
+    // whenever available so Gemini can inspect circles, underlines,
+    // highlights, handwritten additions, and objects already on the board.
+    const sendBoardImage = Boolean(boardImageForGemini);
 
     setIsGenerating(true);
     setAssistantError(null);
@@ -1327,9 +1287,35 @@ export default function LixiaStudio() {
       if (command.type === "teach_lesson") {
         setAssistantPrompt("");
 
+        const currentTextCommand =
+          targetBoard.generatedCommand?.type === "write_text"
+            ? targetBoard.generatedCommand
+            : null;
+        const finalLessonBoard =
+          command.segments[command.segments.length - 1]?.board;
+        const canContinueOnCurrentBoard =
+          currentTextCommand !== null &&
+          finalLessonBoard !== undefined &&
+          canAppendTextCommand(
+            currentTextCommand,
+            finalLessonBoard,
+          );
+        const lessonBoardId =
+          targetBoard.generatedCommand !== null &&
+          !canContinueOnCurrentBoard
+            ? addBoard()
+            : targetBoardId;
+        const lessonToRun =
+          canContinueOnCurrentBoard && currentTextCommand
+            ? appendLessonToTextCommand(
+                currentTextCommand,
+                command,
+              )
+            : command;
+
         void runTeacherLesson(
-          targetBoardId,
-          command,
+          lessonBoardId,
+          lessonToRun,
         );
 
         return;

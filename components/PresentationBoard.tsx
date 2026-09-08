@@ -2853,6 +2853,7 @@ export default function PresentationBoard({
       targetBoardId: number,
       renderRun: number,
       commandVersion: number,
+      animateCommand = true,
     ) => {
       if (!drawingCanvas || !context) {
         return;
@@ -2899,7 +2900,8 @@ export default function PresentationBoard({
 
             const progress = Math.min(
               1,
-              accumulated / Math.max(1, durationMs),
+              accumulated /
+                Math.max(1, animateCommand ? durationMs : 1),
             );
 
             drawFrame(progress);
@@ -3257,12 +3259,6 @@ export default function PresentationBoard({
    * which is then painted onto this same board canvas.
    */
   useEffect(() => {
-    if (generatedCommand?.type === "write_text") {
-      delete completedCommandRenderRef.current[boardId];
-    }
-  }, [boardId, generatedCommand, textSize]);
-
-  useEffect(() => {
     const alreadyRenderedVersion =
       completedCommandRenderRef.current[boardId];
 
@@ -3276,29 +3272,34 @@ export default function PresentationBoard({
       return;
     }
 
-    completedCommandRenderRef.current[boardId] =
-      generatedCommandVersion;
-
     drawingLoadRunRef.current += 1;
     const renderRun = ++commandRenderRunRef.current;
+    const animateCommand =
+      generatedCommand.type !== "write_text" ||
+      alreadyRenderedVersion === undefined;
 
     void renderCommandToBoard(
       generatedCommand,
       boardId,
       renderRun,
       generatedCommandVersion,
-    ).catch((error) => {
+      animateCommand,
+    ).then(() => {
+      if (
+        activeBoardIdRef.current === boardId &&
+        commandRenderRunRef.current === renderRun
+      ) {
+        completedCommandRenderRef.current[boardId] =
+          generatedCommandVersion;
+      }
+    }).catch((error) => {
       console.error(
         "Could not render whiteboard command:",
         error,
       );
 
       // Allow this version to retry if rendering failed.
-      if (
-        activeBoardIdRef.current === boardId &&
-        completedCommandRenderRef.current[boardId] ===
-          generatedCommandVersion
-      ) {
+      if (activeBoardIdRef.current === boardId) {
         delete completedCommandRenderRef.current[boardId];
       }
     });
@@ -3307,12 +3308,8 @@ export default function PresentationBoard({
       if (commandRenderRunRef.current === renderRun) {
         commandRenderRunRef.current += 1;
 
-        if (
-          completedCommandRenderRef.current[boardId] ===
-          generatedCommandVersion
-        ) {
-          delete completedCommandRenderRef.current[boardId];
-        }
+        // Keep completed versions cached so switching boards does not
+        // replay a command that was already written.
       }
     };
   }, [
