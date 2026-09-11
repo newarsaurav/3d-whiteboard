@@ -953,6 +953,7 @@ input {
     0 18px 45px rgba(0, 0, 0, 0.4);
 
   backdrop-filter: blur(16px);
+  will-change: transform;
 }
 
 .assistant-header {
@@ -961,6 +962,13 @@ input {
   gap: 10px;
 
   margin-bottom: 12px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.lixia-assistant-panel.dragging .assistant-header {
+  cursor: grabbing;
 }
 
 .assistant-avatar {

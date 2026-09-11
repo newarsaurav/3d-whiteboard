@@ -6,6 +6,8 @@ import {
   useMemo,
   useRef,
   useState,
+  type ComponentType,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 
 import {
@@ -14,17 +16,21 @@ import {
 } from "@react-three/fiber";
 
 import {
-  Environment,
   OrbitControls,
 } from "@react-three/drei";
+import * as THREE from "three";
 
-import MikeModel from "./MikeModel";
 import type {
   MikeAnimationApi,
   MikeBounds,
+  MikeSpeakingOptions,
 } from "./MikeModel";
 
-import { presentationDirector } from "@lixia/mike-animation";
+import {
+  estimateSpeechSeconds,
+  FALLBACK_LESSON_GESTURES,
+  resolveGesturePlan,
+} from "@/lib/presentationGestures";
 
 import PresentationBoard from "./PresentationBoard";
 import type {
@@ -33,6 +39,11 @@ import type {
 } from "./PresentationBoard";
 
 import StudioEnvironment from "./StudioEnvironment";
+
+type MikeModelComponent = ComponentType<{
+  onMeasured?: (bounds: MikeBounds) => void;
+  onReady?: (api: MikeAnimationApi) => void;
+}>;
 
 import type {
   Board,
@@ -47,17 +58,6 @@ const BOARD_Z = -0.7;
 const HIP_RATIO = 0.42;
 const BELOW_HIP_OFFSET = 0.25;
 const ABOVE_HEAD_OFFSET = 0.75;
-
-/**
- * When Gemini does not name a gesture for a lesson segment, rotate
- * through natural teaching gestures so Mike never freezes mid-lesson.
- */
-const FALLBACK_LESSON_GESTURES = [
-  "explain",
-  "point",
-  "emphasize",
-  "offer",
-] as const;
 
 /** Deterministic gesture for single (non-lesson) board responses. */
 function gestureForBoardCommand(
@@ -304,6 +304,64 @@ function buildSpokenResponse(command: BoardCommand): string {
 }
 
 export default function LixiaStudio() {
+  const assistantPanelRef = useRef<HTMLDivElement>(null);
+  const assistantDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+  const [assistantPosition, setAssistantPosition] = useState({ x: 0, y: 0 });
+  const [isAssistantDragging, setIsAssistantDragging] = useState(false);
+
+  function startAssistantDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    assistantDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: assistantPosition.x,
+      originY: assistantPosition.y,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setIsAssistantDragging(true);
+  }
+
+  function moveAssistantPanel(event: ReactPointerEvent<HTMLDivElement>) {
+    const drag = assistantDragRef.current;
+    const panel = assistantPanelRef.current;
+    const scene = panel?.parentElement;
+    if (!drag || drag.pointerId !== event.pointerId || !panel || !scene) return;
+
+    const panelRect = panel.getBoundingClientRect();
+    const sceneRect = scene.getBoundingClientRect();
+    const baseLeft = panelRect.left - assistantPosition.x;
+    const baseTop = panelRect.top - assistantPosition.y;
+    const desiredX = drag.originX + event.clientX - drag.startX;
+    const desiredY = drag.originY + event.clientY - drag.startY;
+    const inset = 8;
+
+    setAssistantPosition({
+      x: Math.min(
+        sceneRect.right - panelRect.width - baseLeft - inset,
+        Math.max(sceneRect.left - baseLeft + inset, desiredX),
+      ),
+      y: Math.min(
+        sceneRect.bottom - panelRect.height - baseTop - inset,
+        Math.max(sceneRect.top - baseTop + inset, desiredY),
+      ),
+    });
+  }
+
+  function stopAssistantDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (assistantDragRef.current?.pointerId !== event.pointerId) return;
+    assistantDragRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    setIsAssistantDragging(false);
+  }
+
 
 
   const [assistantPrompt, setAssistantPrompt] =
@@ -341,58 +399,15 @@ export default function LixiaStudio() {
 
   const mikeApiRef =
     useRef<MikeAnimationApi | null>(null);
+  const activeSpeechMotionRef =
+    useRef<MikeSpeakingOptions | null>(null);
 
   const handleMikeReady = useCallback(
     (api: MikeAnimationApi) => {
       mikeApiRef.current = api;
-    },
-    [],
-  );
-
-  /**
-   * Resolve a gesture intent through the presentation director (which
-   * only admits approved registry clips). While Mike is speaking, the
-   * model keeps a looping talk pose and chains hand gestures for the
-   * whole narration — this call just picks the next meaningful clip.
-   */
-  const playGestureIntent = useCallback(
-    (intent: string | null | undefined) => {
-      const mike = mikeApiRef.current;
-
-      if (!mike || !intent) {
-        return;
-      }
-
-      try {
-        const plan = presentationDirector.resolve({
-          gesture: intent,
-        });
-
-        if (plan.mode === "idle") {
-          mike.playWaiting();
-          return;
-        }
-
-        if (plan.mode !== "play" || !plan.animation_id) {
-          return;
-        }
-
-        if (plan.record?.body_layer === "upper_body") {
-          void mike.playGesture(plan.animation_id, {
-            repeats: 1,
-          });
-        } else {
-          void mike.playAnimation(plan.animation_id, {
-            repeats: 1,
-          });
-        }
-      } catch (error) {
-        // Unknown intents are non-fatal: Mike simply keeps his
-        // current pose instead of interrupting the lesson.
-        console.warn(
-          `Skipping unknown gesture intent "${intent}":`,
-          error,
-        );
+      const activeSpeech = activeSpeechMotionRef.current;
+      if (activeSpeech) {
+        api.setSpeaking(true, activeSpeech);
       }
     },
     [],
@@ -425,6 +440,19 @@ export default function LixiaStudio() {
 
   const [drawingSpeed, setDrawingSpeed] =
     useState(55);
+
+  const [MikeModel, setMikeModel] =
+    useState<MikeModelComponent | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void import("./MikeModel").then((mod) => {
+      if (!cancelled) setMikeModel(() => mod.default);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const [clearSignal, setClearSignal] =
     useState(0);
@@ -527,6 +555,8 @@ export default function LixiaStudio() {
     stopActiveTeacherAudio();
     setIsTeaching(false);
     setIsTeachingPaused(false);
+    activeSpeechMotionRef.current = null;
+    mikeApiRef.current?.setPaused(false);
     mikeApiRef.current?.setSpeaking(false);
     mikeApiRef.current?.playWaiting();
   }
@@ -549,6 +579,7 @@ export default function LixiaStudio() {
       window.speechSynthesis.pause();
     }
 
+    mikeApiRef.current?.setPaused(true);
     setIsTeachingPaused(true);
   }
 
@@ -570,6 +601,7 @@ export default function LixiaStudio() {
       window.speechSynthesis.resume();
     }
 
+    mikeApiRef.current?.setPaused(false);
     setIsTeachingPaused(false);
   }
 
@@ -592,11 +624,64 @@ export default function LixiaStudio() {
     return samples;
   }
 
+  function startSpeechMotion(
+    runId: number,
+    gestureIntent?: string | null,
+    narration = "",
+    fallbackIndex = 0,
+    durationSeconds = estimateSpeechSeconds(narration),
+  ) {
+    if (runId !== teachingRunRef.current) return;
+    const plan = resolveGesturePlan(gestureIntent, fallbackIndex);
+    const options: MikeSpeakingOptions = {
+      preferredAnimationId: plan.animationId,
+      estimatedDurationSec: durationSeconds,
+      forcePreferred: true,
+    };
+    activeSpeechMotionRef.current = options;
+    mikeApiRef.current?.setSpeaking(true, options);
+  }
+
+  async function prepareSpeechMotion(
+    runId: number,
+    gestureIntent: string | null | undefined,
+    durationSeconds: number,
+    fallbackIndex = 0,
+  ) {
+    if (runId !== teachingRunRef.current) return false;
+    const mike = mikeApiRef.current;
+    if (!mike) return false;
+
+    const plan = resolveGesturePlan(gestureIntent, fallbackIndex);
+    return mike.prepareSpeech({
+      preferredAnimationId: plan.animationId,
+      estimatedDurationSec: durationSeconds,
+      forcePreferred: true,
+    });
+  }
+
+  function stopSpeechMotion(runId: number) {
+    if (runId !== teachingRunRef.current) return;
+    activeSpeechMotionRef.current = null;
+    mikeApiRef.current?.setSpeaking(false);
+    mikeApiRef.current?.playWaiting();
+  }
+
   async function speakTeachingSegmentFallback(
     text: string,
     language: string,
     runId: number,
+    gestureIntent?: string | null,
+    fallbackIndex = 0,
   ): Promise<void> {
+    const estimatedDuration = estimateSpeechSeconds(text);
+    void prepareSpeechMotion(
+      runId,
+      gestureIntent,
+      estimatedDuration,
+      fallbackIndex,
+    );
+
     return new Promise((resolve) => {
       if (
         typeof window === "undefined" ||
@@ -624,9 +709,19 @@ export default function LixiaStudio() {
         }
 
         settled = true;
+        stopSpeechMotion(runId);
         resolve();
       };
 
+      utterance.onstart = () => {
+        startSpeechMotion(
+          runId,
+          gestureIntent,
+          text,
+          fallbackIndex,
+          estimatedDuration,
+        );
+      };
       utterance.onend = finish;
       utterance.onerror = finish;
       synth.speak(utterance);
@@ -637,10 +732,21 @@ export default function LixiaStudio() {
     text: string,
     language: string,
     runId: number,
+    gestureIntent?: string | null,
+    fallbackIndex = 0,
   ): Promise<void> {
     if (!text.trim() || runId !== teachingRunRef.current) {
       return;
     }
+
+    // Warm Mike independently while the original TTS stream starts normally.
+    const speechMotionDuration = estimateSpeechSeconds(text);
+    void prepareSpeechMotion(
+      runId,
+      gestureIntent,
+      speechMotionDuration,
+      fallbackIndex,
+    );
 
     const audioContext = getTeacherAudioContext();
 
@@ -649,6 +755,8 @@ export default function LixiaStudio() {
         text,
         language,
         runId,
+        gestureIntent,
+        fallbackIndex,
       );
       return;
     }
@@ -702,6 +810,7 @@ export default function LixiaStudio() {
         audioContext.currentTime,
       );
       let receivedAudio = false;
+      let speechMotionScheduled = false;
 
       while (true) {
         if (runId !== teachingRunRef.current) {
@@ -767,8 +876,26 @@ export default function LixiaStudio() {
         });
 
         sourceEndPromises.push(ended);
+        const scheduledStart = nextStartTime;
         source.start(nextStartTime);
         nextStartTime += audioBuffer.duration;
+
+        if (!speechMotionScheduled) {
+          speechMotionScheduled = true;
+          const delayMs = Math.max(
+            0,
+            (scheduledStart - audioContext.currentTime) * 1000,
+          );
+          window.setTimeout(() => {
+            startSpeechMotion(
+              runId,
+              gestureIntent,
+              text,
+              fallbackIndex,
+              speechMotionDuration,
+            );
+          }, delayMs);
+        }
       }
 
       if (!receivedAudio) {
@@ -795,8 +922,12 @@ export default function LixiaStudio() {
         text,
         language,
         runId,
+        gestureIntent,
+        fallbackIndex,
       );
     } finally {
+      stopSpeechMotion(runId);
+
       if (
         teacherAbortControllerRef.current?.signal.aborted ||
         runId === teachingRunRef.current
@@ -843,20 +974,18 @@ export default function LixiaStudio() {
         return;
       }
 
-      mikeApiRef.current?.setSpeaking(true);
-      playGestureIntent(gestureForBoardCommand(command));
-
       await speakTeachingSegment(
         narration,
         language,
         runId,
+        gestureForBoardCommand(command),
+        0,
       );
     } finally {
       if (runId === teachingRunRef.current) {
         setIsTeaching(false);
         setIsTeachingPaused(false);
-        mikeApiRef.current?.setSpeaking(false);
-        mikeApiRef.current?.playWaiting();
+        stopSpeechMotion(runId);
       }
     }
   }
@@ -930,8 +1059,6 @@ export default function LixiaStudio() {
     }
 
     try {
-      mikeApiRef.current?.setSpeaking(true);
-
       for (const [
         segmentIndex,
         segment,
@@ -979,17 +1106,18 @@ export default function LixiaStudio() {
           return;
         }
 
-        playGestureIntent(
+        const gestureIntent =
           segment.gesture ??
-            FALLBACK_LESSON_GESTURES[
-              segmentIndex % FALLBACK_LESSON_GESTURES.length
-            ],
-        );
+          FALLBACK_LESSON_GESTURES[
+            segmentIndex % FALLBACK_LESSON_GESTURES.length
+          ];
 
         await speakTeachingSegment(
           segment.narration,
           lesson.language ?? "en-US",
           runId,
+          gestureIntent,
+          segmentIndex,
         );
 
 // <!--         conflict changed 
@@ -1009,8 +1137,7 @@ export default function LixiaStudio() {
       if (runId === teachingRunRef.current) {
         setIsTeaching(false);
         setIsTeachingPaused(false);
-        mikeApiRef.current?.setSpeaking(false);
-        mikeApiRef.current?.playWaiting();
+        stopSpeechMotion(runId);
       }
     }
   }
@@ -1526,8 +1653,22 @@ export default function LixiaStudio() {
             : "Drawing Mode"}
         </div>
 
-        <div className="lixia-assistant-panel">
-          <div className="assistant-header">
+        <div
+          ref={assistantPanelRef}
+          className={`lixia-assistant-panel${isAssistantDragging ? " dragging" : ""}`}
+          style={{
+            transform: `translate3d(${assistantPosition.x}px, ${assistantPosition.y}px, 0)`,
+          }}
+        >
+          <div
+            className="assistant-header"
+            title="Drag to move the assistant panel"
+            onPointerDown={startAssistantDrag}
+            onPointerMove={moveAssistantPanel}
+            onPointerUp={stopAssistantDrag}
+            onPointerCancel={stopAssistantDrag}
+            onDoubleClick={() => setAssistantPosition({ x: 0, y: 0 })}
+          >
             <div className="assistant-avatar">
               L
             </div>
@@ -1701,11 +1842,11 @@ export default function LixiaStudio() {
         </div>
 
         <Canvas
-          shadows
+          shadows={{ type: THREE.PCFShadowMap }}
           camera={{
             position:
               DEFAULT_CAMERA_POSITION,
-            fov: 42,
+            fov: 36,
             near: 0.1,
             far: 100,
           }}
@@ -1723,18 +1864,18 @@ export default function LixiaStudio() {
             castShadow
             position={[5, 8, 6]}
             intensity={2.2}
-            shadow-mapSize-width={2048}
-            shadow-mapSize-height={2048}
+            shadow-mapSize-width={1024}
+            shadow-mapSize-height={1024}
           />
 
           <StudioEnvironment />
 
-          <MikeModel
-            onMeasured={
-              handleMikeMeasured
-            }
-            onReady={handleMikeReady}
-          />
+          {MikeModel ? (
+            <MikeModel
+              onMeasured={handleMikeMeasured}
+              onReady={handleMikeReady}
+            />
+          ) : null}
           <PresentationBoard
             position={[
               BOARD_X,
@@ -1764,8 +1905,6 @@ export default function LixiaStudio() {
               handleBoardRenderComplete
             }
           />
-
-          <Environment preset="city" />
 
           <OrbitControls
             enabled={cameraMode}
