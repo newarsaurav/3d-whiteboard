@@ -12,6 +12,7 @@ import {
 
 import {
   Canvas,
+  useFrame,
   useThree,
 } from "@react-three/fiber";
 
@@ -27,9 +28,12 @@ import type {
 } from "./MikeModel";
 
 import {
+  cameraShotForIntent,
   estimateSpeechSeconds,
   FALLBACK_LESSON_GESTURES,
+  gestureForBoardCommand,
   resolveGesturePlan,
+  shouldLookAtBoard,
 } from "@/lib/presentationGestures";
 
 import PresentationBoard from "./PresentationBoard";
@@ -43,6 +47,8 @@ import StudioEnvironment from "./StudioEnvironment";
 type MikeModelComponent = ComponentType<{
   onMeasured?: (bounds: MikeBounds) => void;
   onReady?: (api: MikeAnimationApi) => void;
+  lookTarget?: [number, number, number] | null;
+  lookStrength?: number;
 }>;
 
 import type {
@@ -59,52 +65,150 @@ const HIP_RATIO = 0.42;
 const BELOW_HIP_OFFSET = 0.25;
 const ABOVE_HEAD_OFFSET = 0.75;
 
-/** Deterministic gesture for single (non-lesson) board responses. */
-function gestureForBoardCommand(
-  command: BoardCommand,
-): string {
-  switch (command.type) {
-    case "flowchart":
-      return "point";
-    case "chart":
-      return "reveal";
-    case "image":
-      return command.mode === "edit" ? "approve" : "reveal";
-    default:
-      return "explain";
+type CameraShot = "waist" | "full" | "close";
+
+const CAMERA_FOV = 34;
+
+const WAIST_CAMERA_POSITION: [
+  number,
+  number,
+  number,
+] = [-0.4, 4.21, 7.46];
+
+const WAIST_CAMERA_TARGET: [
+  number,
+  number,
+  number,
+] = [-0.13, 4.32, -0.71];
+
+const FULL_CAMERA_POSITION: [
+  number,
+  number,
+  number,
+] = [-0.4, 2.72, 12.2];
+
+const FULL_CAMERA_TARGET: [
+  number,
+  number,
+  number,
+] = [-0.13, 2.62, -0.71];
+
+function getShotPose(
+  shot: CameraShot,
+  bounds: MikeBounds | null,
+): { position: THREE.Vector3; target: THREE.Vector3 } {
+  if (shot === "waist") {
+    return {
+      position: new THREE.Vector3(...WAIST_CAMERA_POSITION),
+      target: new THREE.Vector3(...WAIST_CAMERA_TARGET),
+    };
   }
+
+  if (shot === "full") {
+    if (!bounds) {
+      return {
+        position: new THREE.Vector3(...FULL_CAMERA_POSITION),
+        target: new THREE.Vector3(...FULL_CAMERA_TARGET),
+      };
+    }
+
+    const topY = bounds.headY + 0.7;
+    const bottomY = bounds.feetY - 0.2;
+    const midY = (topY + bottomY) / 2;
+    const halfSpan = Math.max(2.8, (topY - bottomY) / 2);
+    const distance =
+      halfSpan / Math.tan(THREE.MathUtils.degToRad(CAMERA_FOV) * 0.5) + 1.5;
+
+    return {
+      position: new THREE.Vector3(
+        WAIST_CAMERA_POSITION[0],
+        midY,
+        WAIST_CAMERA_TARGET[2] + distance,
+      ),
+      target: new THREE.Vector3(
+        WAIST_CAMERA_TARGET[0],
+        midY,
+        WAIST_CAMERA_TARGET[2],
+      ),
+    };
+  }
+
+  if (shot === "close") {
+    if (!bounds) {
+      return {
+        position: new THREE.Vector3(-0.15, 3.35, 6.2),
+        target: new THREE.Vector3(-0.2, 3.15, 0.1),
+      };
+    }
+    const handsY = bounds.waistY - 0.4;
+    const bottomY = Math.max(bounds.feetY + 0.2, handsY);
+    const topY = bounds.headY + 0.14;
+    const midY = (bottomY + topY) / 2;
+    const span = Math.max(1.8, topY - bottomY);
+    const distance = span * 1.62;
+    const mikeBias = 0.58;
+    const lookX = BOARD_X * (1 - mikeBias) + bounds.centerX * mikeBias;
+    const lookZ = BOARD_Z * (1 - mikeBias) + bounds.centerZ * mikeBias;
+    return {
+      position: new THREE.Vector3(lookX, midY, lookZ + distance),
+      target: new THREE.Vector3(lookX, midY, lookZ),
+    };
+  }
+
+  return {
+    position: new THREE.Vector3(...FULL_CAMERA_POSITION),
+    target: new THREE.Vector3(...FULL_CAMERA_TARGET),
+  };
 }
 
-
-
-
-const DEFAULT_CAMERA_POSITION: [
-  number,
-  number,
-  number,
-] = [0, 3.5, 11];
-
-const DEFAULT_CAMERA_TARGET: [
-  number,
-  number,
-  number,
-] = [0.5, 2.2, 0];
-
-
-function InitialCameraSetup() {
-  const { camera } = useThree();
+function CameraShotController({
+  shot,
+  bounds,
+}: {
+  shot: CameraShot;
+  bounds: MikeBounds | null;
+}) {
+  const { camera, controls } = useThree();
+  const pose = useMemo(
+    () => getShotPose(shot, bounds),
+    [shot, bounds],
+  );
+  const currentTarget = useRef(pose.target.clone());
+  const arrivingRef = useRef(true);
+  const shotKey = shot === "waist"
+    ? "waist"
+    : `${shot}:${bounds?.waistY ?? "x"}:${bounds?.headY ?? "x"}`;
 
   useEffect(() => {
-    camera.position.set(
-      ...DEFAULT_CAMERA_POSITION,
-    );
+    arrivingRef.current = true;
+  }, [shotKey]);
 
-    camera.lookAt(
-      ...DEFAULT_CAMERA_TARGET,
-    );
+  useFrame((_, delta) => {
+    if (!arrivingRef.current) return;
 
-    camera.updateProjectionMatrix();
-  }, [camera]);
+    const blend = 1 - Math.exp(-delta * 6);
+    camera.position.lerp(pose.position, blend);
+    currentTarget.current.lerp(pose.target, blend);
+    camera.lookAt(currentTarget.current);
+
+    const orbit = controls as
+      | { target?: THREE.Vector3; update?: () => void }
+      | undefined;
+    if (orbit?.target) {
+      orbit.target.copy(currentTarget.current);
+      orbit.update?.();
+    }
+
+    if (
+      camera.position.distanceTo(pose.position) < 0.035 &&
+      currentTarget.current.distanceTo(pose.target) < 0.035
+    ) {
+      camera.position.copy(pose.position);
+      currentTarget.current.copy(pose.target);
+      camera.lookAt(currentTarget.current);
+      arrivingRef.current = false;
+    }
+  });
 
   return null;
 }
@@ -422,6 +526,40 @@ export default function LixiaStudio() {
   const [cameraMode, setCameraMode] =
     useState(false);
 
+  const [cameraShot, setCameraShot] =
+    useState<CameraShot>("waist");
+
+  const [cameraFollow, setCameraFollow] =
+    useState(true);
+
+  const [lookStrength, setLookStrength] =
+    useState(0);
+
+  const [mikeBounds, setMikeBounds] =
+    useState<MikeBounds | null>(null);
+
+  const cameraFollowRef = useRef(true);
+  const cameraModeRef = useRef(false);
+  const lastBoardCommandRef = useRef<BoardCommand | null>(null);
+  const lastBoardCueVersionRef = useRef(0);
+
+  useEffect(() => {
+    cameraFollowRef.current = cameraFollow;
+  }, [cameraFollow]);
+
+  useEffect(() => {
+    cameraModeRef.current = cameraMode;
+  }, [cameraMode]);
+
+  function applyAutoShot(shot: CameraShot) {
+    if (!cameraFollowRef.current || cameraModeRef.current) return;
+    setCameraShot(shot);
+  }
+
+  function chooseCameraShot(shot: CameraShot) {
+    setCameraFollow(false);
+    setCameraShot(shot);
+  }
   const [tool, setTool] =
     useState<DrawingTool>("pen");
 
@@ -481,7 +619,10 @@ export default function LixiaStudio() {
   }, [boards, activeBoardId]);
 
   const handleMikeMeasured = useCallback(
-    ({ feetY, headY }: MikeBounds) => {
+    (bounds: MikeBounds) => {
+      setMikeBounds(bounds);
+
+      const { feetY, headY } = bounds;
       const characterHeight =
         headY - feetY;
 
@@ -509,6 +650,26 @@ export default function LixiaStudio() {
     },
     [],
   );
+
+  useEffect(() => {
+    if (!isGenerating && !isTeaching) {
+      mikeApiRef.current?.setIdleMode("rest");
+      mikeApiRef.current?.setLookAtBoard(false);
+      setLookStrength(0);
+    }
+  }, [isGenerating, isTeaching]);
+
+  useEffect(() => {
+    const command = activeBoard.generatedCommand;
+    if (!command || command.type === "teach_lesson") return;
+    lastBoardCommandRef.current = command;
+    const version = activeBoard.generatedCommandVersion;
+    if (!version || lastBoardCueVersionRef.current === version) return;
+    lastBoardCueVersionRef.current = version;
+    if (cameraFollowRef.current) {
+      applyAutoShot("full");
+    }
+  }, [activeBoard]);
 
   function getTeacherAudioContext(): AudioContext | null {
     if (typeof window === "undefined") {
@@ -558,7 +719,11 @@ export default function LixiaStudio() {
     activeSpeechMotionRef.current = null;
     mikeApiRef.current?.setPaused(false);
     mikeApiRef.current?.setSpeaking(false);
+    mikeApiRef.current?.setLookAtBoard(false);
+    mikeApiRef.current?.setIdleMode("rest");
     mikeApiRef.current?.playWaiting();
+    setLookStrength(0);
+    applyAutoShot("waist");
   }
 
   async function pauseTeaching() {
@@ -637,9 +802,15 @@ export default function LixiaStudio() {
       preferredAnimationId: plan.animationId,
       estimatedDurationSec: durationSeconds,
       forcePreferred: true,
+      lookAtBoard: shouldLookAtBoard(plan.intent),
     };
     activeSpeechMotionRef.current = options;
+    setLookStrength(shouldLookAtBoard(plan.intent) ? 0.4 : 0.24);
+    applyAutoShot(cameraShotForIntent(plan.intent));
     mikeApiRef.current?.setSpeaking(true, options);
+    if (shouldLookAtBoard(plan.intent)) {
+      mikeApiRef.current?.setLookAtBoard(true, 0.4);
+    }
   }
 
   async function prepareSpeechMotion(
@@ -657,6 +828,7 @@ export default function LixiaStudio() {
       preferredAnimationId: plan.animationId,
       estimatedDurationSec: durationSeconds,
       forcePreferred: true,
+      lookAtBoard: shouldLookAtBoard(plan.intent),
     });
   }
 
@@ -664,7 +836,10 @@ export default function LixiaStudio() {
     if (runId !== teachingRunRef.current) return;
     activeSpeechMotionRef.current = null;
     mikeApiRef.current?.setSpeaking(false);
+    mikeApiRef.current?.setLookAtBoard(false);
     mikeApiRef.current?.playWaiting();
+    setLookStrength(0);
+    applyAutoShot("waist");
   }
 
   async function speakTeachingSegmentFallback(
@@ -953,6 +1128,8 @@ export default function LixiaStudio() {
     teachingRunRef.current = runId;
     setIsTeaching(true);
     setIsTeachingPaused(false);
+    setCameraFollow(true);
+    applyAutoShot("full");
 
     const audioContext = getTeacherAudioContext();
 
@@ -1000,6 +1177,10 @@ export default function LixiaStudio() {
         boardRenderWaitersRef.current.delete(key);
         resolve();
       }
+
+      if (activeSpeechMotionRef.current) return;
+      applyAutoShot("waist");
+      setLookStrength(0);
     },
     [],
   );
@@ -1047,6 +1228,8 @@ export default function LixiaStudio() {
     teachingRunRef.current = runId;
     setIsTeaching(true);
     setIsTeachingPaused(false);
+    setCameraFollow(true);
+    applyAutoShot("full");
 
     const audioContext = getTeacherAudioContext();
 
@@ -1334,6 +1517,7 @@ export default function LixiaStudio() {
     const sendBoardImage = Boolean(boardImageForGemini);
 
     setIsGenerating(true);
+    setCameraFollow(true);
     setAssistantError(null);
 
     try {
@@ -1645,12 +1829,63 @@ export default function LixiaStudio() {
           >
             📷
           </button>
+
+          <div className="toolbar-divider" />
+
+          <button
+            type="button"
+            className={
+              cameraShot === "waist"
+                ? "toolbar-button shot active"
+                : "toolbar-button shot"
+            }
+            onClick={() => chooseCameraShot("waist")}
+            title="Waist-up camera"
+          >
+            ½
+          </button>
+
+          <button
+            type="button"
+            className={
+              cameraShot === "full"
+                ? "toolbar-button shot active"
+                : "toolbar-button shot"
+            }
+            onClick={() => chooseCameraShot("full")}
+            title="Full-body camera"
+          >
+            🧍
+          </button>
+
+          <button
+            type="button"
+            className={
+              cameraFollow
+                ? "toolbar-button shot active"
+                : "toolbar-button shot"
+            }
+            onClick={() => {
+              setCameraFollow(true);
+              applyAutoShot(isTeaching || isGenerating ? cameraShot : "waist");
+            }}
+            title="Auto camera with the lesson"
+          >
+            A
+          </button>
         </div>
 
         <div className="mode-label">
           {cameraMode
             ? "Camera Mode"
             : "Drawing Mode"}
+          {cameraFollow
+            ? " · Auto"
+            : cameraShot === "close"
+              ? " · Close"
+              : cameraShot === "waist"
+                ? " · Waist"
+                : " · Full"}
         </div>
 
         <div
@@ -1845,13 +2080,16 @@ export default function LixiaStudio() {
           shadows={{ type: THREE.PCFShadowMap }}
           camera={{
             position:
-              DEFAULT_CAMERA_POSITION,
-            fov: 36,
+              WAIST_CAMERA_POSITION,
+            fov: CAMERA_FOV,
             near: 0.1,
             far: 100,
           }}
         >
-          <InitialCameraSetup />
+          <CameraShotController
+            shot={cameraShot}
+            bounds={mikeBounds}
+          />
 
           <color
             attach="background"
@@ -1874,6 +2112,12 @@ export default function LixiaStudio() {
             <MikeModel
               onMeasured={handleMikeMeasured}
               onReady={handleMikeReady}
+              lookTarget={[
+                BOARD_X,
+                boardLayout.y + boardLayout.frameHeight * 0.16,
+                BOARD_Z,
+              ]}
+              lookStrength={lookStrength}
             />
           ) : null}
           <PresentationBoard
@@ -1907,16 +2151,14 @@ export default function LixiaStudio() {
           />
 
           <OrbitControls
+            makeDefault
             enabled={cameraMode}
-            target={
-              DEFAULT_CAMERA_TARGET
-            }
             enableRotate
             enableZoom
             enablePan
             enableDamping
             dampingFactor={0.08}
-            minDistance={6}
+            minDistance={3}
             maxDistance={18}
           />
         </Canvas>

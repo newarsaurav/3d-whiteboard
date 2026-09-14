@@ -879,6 +879,11 @@ input {
   background: #0e7490;
 }
 
+.studio-toolbar.vertical .toolbar-button.shot {
+  font-size: 13px;
+  font-weight: 700;
+}
+
 .studio-toolbar.vertical .toolbar-button.danger {
   border-color: rgba(248, 113, 113, 0.55);
   background: #7f1d1d;
