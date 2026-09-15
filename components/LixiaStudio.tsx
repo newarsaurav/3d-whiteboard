@@ -1345,6 +1345,10 @@ export default function LixiaStudio() {
         body: JSON.stringify({
           prompt,
           currentCommand: targetBoard.generatedCommand,
+          boards: boards.map((board) => ({
+            id: board.id,
+            name: board.name,
+          })),
           boardImage: sendBoardImage
             ? boardImageForGemini
             : null,
@@ -1369,6 +1373,21 @@ export default function LixiaStudio() {
           clearBoard();
         } else if (data.management.action === "delete") {
           deleteBoard(targetBoardId);
+        } else if (data.management.action === "select") {
+          const requestedName = data.management.boardName?.trim().toLowerCase();
+          const requestedBoard = boards.find(
+            (board) =>
+              (data.management?.boardId !== undefined &&
+                board.id === data.management.boardId) ||
+              (requestedName !== undefined &&
+                board.name.toLowerCase() === requestedName),
+          );
+
+          if (!requestedBoard) {
+            throw new Error("I could not find that board.");
+          }
+
+          selectBoard(requestedBoard.id);
         } else {
           const newBoardId = addBoard();
           const newCommand: BoardCommand = {

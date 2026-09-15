@@ -25,6 +25,7 @@ interface GeminiRequestBody {
   prompt?: unknown;
   boardImage?: unknown;
   currentCommand?: unknown;
+  boards?: unknown;
 }
 
 interface GeocodingResult {
@@ -135,14 +136,22 @@ const writeTextDeclaration: FunctionDeclaration = {
 const manageBoardDeclaration: FunctionDeclaration = {
   name: "manage_board",
   description:
-    "Manage whiteboard tabs when the user asks to create/add a new board, delete/remove the current board, or clear the current board. For create, include concise initial board content about the requested topic.",
+    "Manage whiteboard tabs when the user asks to create/add a new board, open/select a specific board, delete/remove the current board, or clear the current board. For create, include concise initial board content about the requested topic. For select, use the matching boardId or boardName from the available board list.",
   parametersJsonSchema: {
     type: "object",
     properties: {
       action: {
         type: "string",
-        enum: ["create", "delete", "clear"],
+        enum: ["create", "select", "delete", "clear"],
         description: "The board management action to perform.",
+      },
+      boardId: {
+        type: "number",
+        description: "ID of an existing board to select.",
+      },
+      boardName: {
+        type: "string",
+        description: "Exact name of an existing board to select.",
       },
       topic: {
         type: "string",
@@ -1125,6 +1134,24 @@ function serializeCurrentCommand(value: unknown): string {
   }
 }
 
+function serializeBoards(value: unknown): string {
+  if (!Array.isArray(value)) {
+    return "(none)";
+  }
+
+  const boards = value
+    .filter((board): board is Record<string, unknown> =>
+      Boolean(board && typeof board === "object"),
+    )
+    .map((board) => ({
+      id: readNumber(board.id, 0),
+      name: readString(board.name, "", 120),
+    }))
+    .filter((board) => board.id > 0 && board.name);
+
+  return boards.length > 0 ? JSON.stringify(boards) : "(none)";
+}
+
 export async function POST(request: Request) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -1169,6 +1196,7 @@ export async function POST(request: Request) {
       : null;
 
     const currentCommandValue = body.currentCommand;
+    const boards = serializeBoards(body.boards);
 
     const currentCommand = serializeCurrentCommand(
       currentCommandValue,
@@ -1188,7 +1216,7 @@ ROUTING RULES:
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
 - generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
 - edit_board_image: modify a visual already visible on the board, for example "add a dog beside that cat", "remove the tree", or "make the cat bigger". By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
-- manage_board: create/add a new board, delete/remove the current board, or clear the current board. For create, include concise initial content in the same tool call.
+- manage_board: create/add a new board, select/open an existing board, delete/remove the current board, or clear the current board. For select, match the user's requested board to the available board list and return its boardId or exact boardName. For create, include concise initial content in the same tool call.
 
 BOARD CONTEXT:
 - The current structured board content is included below.
@@ -1244,6 +1272,9 @@ ANIMATION SPEED:
 
 Current structured board content:
 ${currentCommand}
+
+Available boards:
+${boards}
 
 User request:
 ${prompt}
@@ -1326,7 +1357,12 @@ ${prompt}
     if (functionCall.name === "manage_board") {
       const action = readString(args.action, "", 20);
 
-      if (action !== "create" && action !== "delete" && action !== "clear") {
+      if (
+        action !== "create" &&
+        action !== "select" &&
+        action !== "delete" &&
+        action !== "clear"
+      ) {
         throw new Error("Gemini returned an invalid board management action.");
       }
 
@@ -1335,6 +1371,16 @@ ${prompt}
         action,
         ...(readString(args.topic, "", 120)
           ? { topic: readString(args.topic, "", 120) }
+          : {}),
+        ...(action === "select"
+          ? {
+              ...(readNumber(args.boardId, 0) > 0
+                ? { boardId: readNumber(args.boardId, 0) }
+                : {}),
+              ...(readString(args.boardName, "", 120)
+                ? { boardName: readString(args.boardName, "", 120) }
+                : {}),
+            }
           : {}),
         ...(action === "create"
           ? {

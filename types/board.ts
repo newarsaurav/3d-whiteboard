@@ -123,12 +123,15 @@ export interface BoardImageCommand {
 export type BoardManagementAction =
   | "create"
   | "delete"
-  | "clear";
+  | "clear"
+  | "select";
 
 export interface BoardManagementCommand {
   type: "manage_board";
   action: BoardManagementAction;
   topic?: string;
+  boardId?: number;
+  boardName?: string;
   title?: string;
   bullets?: string[];
   formulas?: string[];
