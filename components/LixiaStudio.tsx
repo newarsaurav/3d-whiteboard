@@ -238,6 +238,43 @@ function getBoardImageForGemini(
   return null;
 }
 
+function getBoardSearchText(board: Board): string {
+  const command = board.generatedCommand;
+
+  if (!command) {
+    return "";
+  }
+
+  if (command.type === "write_text") {
+    return [
+      command.title,
+      ...command.bullets,
+      ...(command.formulas ?? []),
+      command.note ?? "",
+    ].join(" ");
+  }
+
+  if (command.type === "flowchart") {
+    return [
+      command.title,
+      ...command.nodes.map((node) => node.label),
+      ...command.edges.map((edge) => edge.label ?? ""),
+    ].join(" ");
+  }
+
+  if (command.type === "chart") {
+    return [
+      command.title,
+      command.subtitle ?? "",
+      command.xAxisLabel ?? "",
+      command.yAxisLabel ?? "",
+      ...command.series.map((series) => series.label),
+    ].join(" ");
+  }
+
+  return command.title ?? "";
+}
+
 function estimateTextCommandLength(
   command: BoardCommand,
 ): number {
@@ -1532,6 +1569,7 @@ export default function LixiaStudio() {
           boards: boards.map((board) => ({
             id: board.id,
             name: board.name,
+            searchText: getBoardSearchText(board),
           })),
           boardImage: sendBoardImage
             ? boardImageForGemini

@@ -1146,6 +1146,7 @@ function serializeBoards(value: unknown): string {
     .map((board) => ({
       id: readNumber(board.id, 0),
       name: readString(board.name, "", 120),
+      content: readString(board.searchText, "", 1200),
     }))
     .filter((board) => board.id > 0 && board.name);
 
@@ -1216,7 +1217,7 @@ ROUTING RULES:
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
 - generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
 - edit_board_image: modify a visual already visible on the board, for example "add a dog beside that cat", "remove the tree", or "make the cat bigger". By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
-- manage_board: create/add a new board, select/open an existing board, delete/remove the current board, or clear the current board. For select, match the user's requested board to the available board list and return its boardId or exact boardName. For create, include concise initial content in the same tool call.
+- manage_board: create/add a new board, select/open an existing board, delete/remove the current board, or clear the current board. For select, match the user's requested board by its name, ID, or content in the available board list, then return that board's boardId. For create, include concise initial content in the same tool call.
 
 BOARD CONTEXT:
 - The current structured board content is included below.
