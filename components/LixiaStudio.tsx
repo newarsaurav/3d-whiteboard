@@ -1713,9 +1713,13 @@ export default function LixiaStudio() {
               command,
             )
           : command;
+        const isImageEdit =
+          command.type === "image" &&
+          command.mode === "edit";
       const needsNewBoard =
         targetBoard.generatedCommand !== null &&
-        !shouldAppend;
+          !shouldAppend &&
+          !isImageEdit;
       const commandTargetBoardId = needsNewBoard
         ? addBoard()
         : targetBoardId;

@@ -1216,7 +1216,7 @@ ROUTING RULES:
 - draw_flowchart: flowcharts, workflows, processes, decision trees, sequences with arrows.
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
 - generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
-- edit_board_image: modify a visual already visible on the board, for example "add a dog beside that cat", "remove the tree", or "make the cat bigger". By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
+- edit_board_image: modify a visual already visible on the board, including a specific part of it, for example "change the leaf", "make the flower petals red", "add a dog beside that cat", "remove the tree", or "make the cat bigger". Use this for any follow-up that says change, edit, remove, add to, recolor, resize, move, or otherwise adjust something in the existing drawing. By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
 - manage_board: create/add a new board, select/open an existing board, delete/remove the current board, or clear the current board. For select, match the user's requested board by its name, ID, or content in the available board list, then return that board's boardId. For create, include concise initial content in the same tool call.
 
 BOARD CONTEXT:
@@ -1224,6 +1224,7 @@ BOARD CONTEXT:
 - A current board screenshot may also be attached for follow-up context.
 - When a current board screenshot is attached, inspect it before answering. Pay attention to the user's hand-drawn circles, underlines, highlights, arrows, marks, and the object or text those marks point to. If the user asks what is inside, what something is, or what they pointed to, answer from the attached board image rather than guessing from structured text alone.
 - If the user says "it", "that", "this chart", "add", "change", "remove", "make it a bar chart", etc., use the existing board context and return the COMPLETE updated content through the appropriate tool.
+- For a follow-up that refers to an object or part of an existing image (for example "change the leaf" after drawing a flower), always use edit_board_image and keep the edit on the current board. Do not use generate_image for that follow-up.
 - If the user asks a clearly unrelated new question, replace the old topic with the new content.
 - Keep whiteboard content concise and readable.
 - For flowcharts, use row 0-5 and column 0-3 and avoid overlapping grid positions.
