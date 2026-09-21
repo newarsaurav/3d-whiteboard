@@ -1397,6 +1397,9 @@ export default function LixiaStudio() {
         board.id === activeBoardId
           ? {
               ...board,
+              previousDrawing: board.drawing,
+              previousGeneratedCommand: board.generatedCommand,
+              drawing: null,
               generatedCommand: null,
             }
           : board,
@@ -1406,6 +1409,22 @@ export default function LixiaStudio() {
     setClearSignal(
       (currentSignal) =>
         currentSignal + 1,
+    );
+  }
+
+  function restoreBoard() {
+    setBoards((currentBoards) =>
+      currentBoards.map((board) =>
+        board.id === activeBoardId
+          ? {
+              ...board,
+              drawing: board.previousDrawing ?? null,
+              generatedCommand: board.previousGeneratedCommand ?? null,
+              previousDrawing: null,
+              previousGeneratedCommand: null,
+            }
+          : board,
+      ),
     );
   }
 
@@ -1593,6 +1612,8 @@ export default function LixiaStudio() {
       if (data.management) {
         if (data.management.action === "clear") {
           clearBoard();
+        } else if (data.management.action === "restore") {
+          restoreBoard();
         } else if (data.management.action === "delete") {
           deleteBoard(targetBoardId);
         } else if (data.management.action === "select") {

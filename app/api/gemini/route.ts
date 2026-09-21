@@ -136,13 +136,13 @@ const writeTextDeclaration: FunctionDeclaration = {
 const manageBoardDeclaration: FunctionDeclaration = {
   name: "manage_board",
   description:
-    "Manage whiteboard tabs when the user asks to create/add a new board, open/select a specific board, delete/remove the current board, or clear the current board. For create, include concise initial board content about the requested topic. For select, use the matching boardId or boardName from the available board list.",
+    "Manage whiteboard tabs when the user asks to create/add a new board, open/select a specific board, delete/remove the current board, clear the current board, or restore content cleared earlier. Use restore for requests such as redo that board, bring it back, undo the clear, or restore what was there before. For create, include concise initial board content about the requested topic. For select, use the matching boardId or boardName from the available board list.",
   parametersJsonSchema: {
     type: "object",
     properties: {
       action: {
         type: "string",
-        enum: ["create", "select", "delete", "clear"],
+        enum: ["create", "select", "delete", "clear", "restore"],
         description: "The board management action to perform.",
       },
       boardId: {
@@ -1003,12 +1003,13 @@ async function buildImageCommand(
       ].join("\n")
     : [
         "Style: simple classroom whiteboard marker drawing.",
-        "Use bold clean dark marker outlines on a pure white background.",
+        "Use bold clean dark marker outlines with a transparent background, like an isolated PNG sticker.",
         "Prioritize a clear recognizable silhouette first, then add only a few important interior details.",
         "Make cartoon characters and animals easy to recognize from a distance.",
         "Use loose hand-drawn contours with occasional retraced lines, small overshoots, and slight wobble.",
         "Keep the drawing simple and readable: avoid tiny details, clutter, dense hatching, or broken fragmented lines.",
         "Do not use gradients, shadows, photographic texture, or large filled areas.",
+        "Never draw a background, floor, sky, scenery, setting, or white rectangle.",
         "Do not add text, labels, borders, watermarks, or a poster-like layout.",
         "The final result should look like a teacher quickly sketched it with a black dry-erase marker.",
       ].join("\n");
@@ -1023,9 +1024,11 @@ ${styleInstructions}
 
 Rules:
 - Preserve every existing element that the user did NOT ask to change.
+- Add only the requested new element; do not redraw the whole existing picture.
 - Keep the same overall 16:9 whiteboard composition.
 - Do not replace, restyle, or distort unrelated content.
 - If adding an object, place it naturally without covering important existing content.
+- Keep all empty areas transparent; do not add a background or white rectangle.
 - If the current board already looks hand-drawn, continue in the same whiteboard-doodle style unless the user explicitly asks for realistic style.
 - Do not add new text, labels, borders, watermarks, or captions unless explicitly requested.
 - Return only the edited image.
@@ -1042,7 +1045,7 @@ Rules:
 - Compose the subject clearly with comfortable margins so it looks good on a whiteboard.
 - Keep the subject large enough and visually simple enough to remain recognizable after whiteboard rendering.
 - Avoid unnecessary text, labels, frames, watermarks, or captions.
-- When the user does not explicitly request a background, setting, environment, or scene, draw only the requested subject as an isolated doodle on the plain whiteboard background. Do not add scenery, ground, sky, shadows, props, or decorative background elements.
+- Always draw only the requested subject as an isolated PNG-like doodle with a transparent background. Do not add scenery, ground, sky, shadows, props, or decorative background elements.
 - Include a background or setting only when the user's request explicitly names one, and then show only the requested subject together with that requested background.
 - Return only the generated image.
       `.trim();
@@ -1217,7 +1220,7 @@ ROUTING RULES:
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
 - generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
 - edit_board_image: modify a visual already visible on the board, including a specific part of it, for example "change the leaf", "make the flower petals red", "add a dog beside that cat", "remove the tree", or "make the cat bigger". Use this for any follow-up that says change, edit, remove, add to, recolor, resize, move, or otherwise adjust something in the existing drawing. By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
-- manage_board: create/add a new board, select/open an existing board, delete/remove the current board, or clear the current board. For select, match the user's requested board by its name, ID, or content in the available board list, then return that board's boardId. For create, include concise initial content in the same tool call.
+- manage_board: create/add a new board, select/open an existing board, delete/remove the current board, clear the current board, or restore content cleared earlier. Use restore when the user says redo, bring it back, undo the clear, or restore what was there before. For select, match the user's requested board by its name, ID, or content in the available board list, then return that board's boardId. For create, include concise initial content in the same tool call.
 
 BOARD CONTEXT:
 - The current structured board content is included below.
@@ -1354,6 +1357,22 @@ ${prompt}
         ? (functionCall.args as Record<string, unknown>)
         : {};
 
+    const isAdditiveImageRequest =
+      Boolean(boardImagePart) &&
+      /\b(add|place|put|include|beside|next to|alongside)\b/i.test(prompt);
+
+    const shouldEditExistingImage =
+      functionCall.name === "edit_board_image" ||
+      (functionCall.name === "generate_image" && isAdditiveImageRequest);
+
+    const imageEditArgs =
+      functionCall.name === "generate_image" && isAdditiveImageRequest
+        ? {
+            ...args,
+            instruction: readString(args.prompt, prompt, 1200),
+          }
+        : args;
+
     let command: BoardCommand | TeacherLessonCommand | BoardManagementCommand;
 
     if (functionCall.name === "manage_board") {
@@ -1363,7 +1382,8 @@ ${prompt}
         action !== "create" &&
         action !== "select" &&
         action !== "delete" &&
-        action !== "clear"
+        action !== "clear" &&
+        action !== "restore"
       ) {
         throw new Error("Gemini returned an invalid board management action.");
       }
@@ -1415,7 +1435,7 @@ ${prompt}
       command = buildFlowchartCommand(args);
     } else if (functionCall.name === "plot_weather_history") {
       command = await buildWeatherChart(args);
-    } else if (functionCall.name === "generate_image") {
+    } else if (functionCall.name === "generate_image" && !shouldEditExistingImage) {
       command = await buildImageCommand(
         ai,
         args,
@@ -1423,10 +1443,10 @@ ${prompt}
         null,
         currentCommandValue,
       );
-    } else if (functionCall.name === "edit_board_image") {
+    } else if (shouldEditExistingImage) {
       command = await buildImageCommand(
         ai,
-        args,
+        imageEditArgs,
         "edit",
         boardImagePart,
         currentCommandValue,
