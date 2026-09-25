@@ -382,7 +382,7 @@ const plotWeatherHistoryDeclaration: FunctionDeclaration = {
 const generateImageDeclaration: FunctionDeclaration = {
   name: "generate_image",
   description:
-    "Generate a new image for the whiteboard. By default, make it look like a hand-drawn whiteboard doodle or marker sketch. Only make it realistic/photo-like when the user explicitly asks for realistic, photo, or photorealistic style. Use this for requests such as draw/show/create/generate a cat, dog, person, object, scene, or other visual that should be an image rather than a flowchart or simple text answer.",
+    "Generate a new image for the whiteboard. By default, make it look like a hand-drawn whiteboard doodle or marker sketch. Only make it realistic/photo-like when the user explicitly asks for realistic, photo, or photorealistic style. Use this for requests such as draw/show/create/generate a cat, dog, person, object, scene, or other visual that should be an image rather than a flowchart or simple text answer. If the user asks to explain and draw, include a fuller explanation; if they only ask to draw something, include a very short description of the subject.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -396,6 +396,11 @@ const generateImageDeclaration: FunctionDeclaration = {
         description:
           "Optional short title describing the generated image. Do not invent a title when none is useful.",
       },
+      explanation: {
+        type: "string",
+        description:
+          "If the user asks to explain and draw, provide a fuller concise description of the subject and its important parts. If the user only asks to draw or sketch something, provide a very short summary such as 'A simple sketch of a cat.'",
+      },
     },
     required: ["prompt"],
   },
@@ -404,7 +409,7 @@ const generateImageDeclaration: FunctionDeclaration = {
 const editBoardImageDeclaration: FunctionDeclaration = {
   name: "edit_board_image",
   description:
-    "Edit the CURRENT visible whiteboard image. By default, preserve or create a hand-drawn whiteboard doodle/marker-sketch look unless the user explicitly asks for realistic/photo style. Use this for visual follow-ups such as add a dog beside that cat, remove the tree, change its color, make the cat bigger, move it left, or otherwise modify an image already on the board. Preserve everything the user did not ask to change.",
+    "Edit the CURRENT visible whiteboard image. By default, preserve or create a hand-drawn whiteboard doodle/marker-sketch look unless the user explicitly asks for realistic/photo style. Use this for visual follow-ups such as add a dog beside that cat, remove the tree, change its color, make the cat bigger, move it left, or otherwise modify an image already on the board. Preserve everything the user did not ask to change. If the user asks to explain and draw, include a fuller explanation; if they only ask to draw, include a short description of the final result.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -417,6 +422,11 @@ const editBoardImageDeclaration: FunctionDeclaration = {
         type: "string",
         description:
           "Optional short title for the edited image/scene.",
+      },
+      explanation: {
+        type: "string",
+        description:
+          "If the user asks to explain and draw or describe the edited picture, provide a fuller concise description. If they only ask to draw or edit the image, provide a short summary such as 'A dog next to a cat.'",
       },
     },
     required: ["instruction"],
@@ -964,6 +974,23 @@ async function buildImageCommand(
       ? readString(args.instruction, "", 1200)
       : readString(args.prompt, "", 1200);
 
+  const wantsExplanation = /\b(explain|describe|tell me about|what is|what are|why|how does|show and explain)\b/i.test(requestedText);
+  const wantsDrawing = /\b(draw|sketch|create|generate|show|make|illustrate|picture)\b/i.test(requestedText);
+
+  const shortImageSummary = (() => {
+    const clean = requestedText
+      .replace(/\b(draw|sketch|create|generate|show|make|illustrate|picture|image|of)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const subject = clean
+      .replace(/^(a|an|the)\s+/i, "")
+      .replace(/[.!?]+$/g, "")
+      .trim();
+
+    return subject ? `A simple sketch of ${subject}.` : "A simple sketch.";
+  })();
+
   if (!requestedText) {
     throw new Error(
       mode === "edit"
@@ -1097,9 +1124,19 @@ Rules:
     generatedImagePart?.inlineData?.mimeType ||
     "image/png";
 
+  const explanationText = readString(args.explanation, "", 900);
+  const finalExplanation =
+    explanationText ||
+    (wantsDrawing
+      ? wantsExplanation
+        ? `${requestedText.replace(/[.!?]+$/g, "").trim()}. The drawing highlights the key parts clearly.`
+        : shortImageSummary
+      : "");
+
   return {
     type: "image",
     ...(title ? { title } : {}),
+    ...(finalExplanation ? { explanation: finalExplanation } : {}),
     imageDataUrl: `data:${mimeType};base64,${imageData}`,
     style: prefersRealistic ? "realistic" : "doodle",
     mode,
@@ -1220,6 +1257,9 @@ ROUTING RULES:
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
 - generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
 - edit_board_image: modify a visual already visible on the board, including a specific part of it, for example "change the leaf", "make the flower petals red", "add a dog beside that cat", "remove the tree", or "make the cat bigger". Use this for any follow-up that says change, edit, remove, add to, recolor, resize, move, or otherwise adjust something in the existing drawing. By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
+- If the user asks only to explain or describe the existing picture, use write_text and do not create or edit an image. Inspect the attached board image and explain what is visible.
+- If the user asks to explain and draw, explain with drawing, or describe and draw, use the image tool and include a fuller explanation field covering the subject and important parts.
+- If the user only says draw, sketch, create, or show something, still include a very short explanation field such as "A simple sketch of a cat." so the assistant can briefly describe the drawing after it is created.
 - manage_board: create/add a new board, select/open an existing board, delete/remove the current board, clear the current board, or restore content cleared earlier. Use restore when the user says redo, bring it back, undo the clear, or restore what was there before. For select, match the user's requested board by its name, ID, or content in the available board list, then return that board's boardId. For create, include concise initial content in the same tool call.
 
 BOARD CONTEXT:

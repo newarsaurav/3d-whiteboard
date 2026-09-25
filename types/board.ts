@@ -107,6 +107,7 @@ export interface BoardChartCommand {
 export interface BoardImageCommand {
   type: "image";
   title?: string;
+  explanation?: string;
 
   // Base64 data URL returned by Gemini Image.
   imageDataUrl: string;

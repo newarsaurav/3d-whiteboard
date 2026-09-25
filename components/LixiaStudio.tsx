@@ -434,11 +434,15 @@ function buildSpokenResponse(command: BoardCommand): string {
   }
 
   if (command.type === "image") {
-    const subject = command.title?.trim() || "the requested drawing";
+    if (!command.explanation?.trim()) {
+      const title = command.title?.trim();
+      if (title) {
+        return `I have drawn ${title.toLowerCase()}.`;
+      }
+      return "I have drawn the image on the board.";
+    }
 
-    return command.mode === "edit"
-      ? `I have updated ${subject} on the whiteboard.`
-      : `I have drawn ${subject} on the whiteboard.`;
+    return command.explanation.trim();
   }
 
   return "I have updated the whiteboard.";
@@ -698,7 +702,7 @@ export default function LixiaStudio() {
 
   useEffect(() => {
     const command = activeBoard.generatedCommand;
-    if (!command || command.type === "teach_lesson") return;
+    if (!command) return;
     lastBoardCommandRef.current = command;
     const version = activeBoard.generatedCommandVersion;
     if (!version || lastBoardCueVersionRef.current === version) return;
