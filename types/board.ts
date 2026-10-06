@@ -116,6 +116,7 @@ export interface BoardChartCommand {
 export interface BoardImageCommand {
   type: "image";
   title?: string;
+  explanation?: string;
 
   // Base64 data URL returned by Gemini Image.
   imageDataUrl: string;
@@ -132,12 +133,16 @@ export interface BoardImageCommand {
 export type BoardManagementAction =
   | "create"
   | "delete"
-  | "clear";
+  | "clear"
+  | "restore"
+  | "select";
 
 export interface BoardManagementCommand {
   type: "manage_board";
   action: BoardManagementAction;
   topic?: string;
+  boardId?: number;
+  boardName?: string;
   title?: string;
   bullets?: string[];
   formulas?: string[];
@@ -157,6 +162,10 @@ export interface Board {
   // Final PNG snapshot of everything currently visible on the board.
   // This is also what Gemini can inspect for follow-up requests.
   drawing: string | null;
+
+  // Content saved by the most recent clear, available only on request.
+  previousDrawing?: string | null;
+  previousGeneratedCommand?: BoardCommand | null;
 
   // Structured AI command rendered by our own canvas code.
   // Images are returned as a BoardImageCommand and then painted

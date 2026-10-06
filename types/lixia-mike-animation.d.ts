@@ -147,6 +147,7 @@ declare module "@lixia/mike-animation" {
     fade?: number;
     layer?: string;
     seamlessHandoff?: boolean;
+    transitionLeadSeconds?: number;
   }
 
   export interface PlaybackQueue {

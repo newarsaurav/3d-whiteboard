@@ -26,6 +26,7 @@ interface GeminiRequestBody {
   prompt?: unknown;
   boardImage?: unknown;
   currentCommand?: unknown;
+  boards?: unknown;
 }
 
 interface GeocodingResult {
@@ -188,14 +189,22 @@ const writeTextDeclaration: FunctionDeclaration = {
 const manageBoardDeclaration: FunctionDeclaration = {
   name: "manage_board",
   description:
-    "Manage whiteboard tabs when the user asks to create/add a new board, delete/remove the current board, or clear the current board. For create, include concise initial board content about the requested topic.",
+    "Manage whiteboard tabs when the user asks to create/add a new board, open/select a specific board, delete/remove the current board, clear the current board, or restore content cleared earlier. Use restore for requests such as redo that board, bring it back, undo the clear, or restore what was there before. For create, include concise initial board content about the requested topic. For select, use the matching boardId or boardName from the available board list.",
   parametersJsonSchema: {
     type: "object",
     properties: {
       action: {
         type: "string",
-        enum: ["create", "delete", "clear"],
+        enum: ["create", "select", "delete", "clear", "restore"],
         description: "The board management action to perform.",
+      },
+      boardId: {
+        type: "number",
+        description: "ID of an existing board to select.",
+      },
+      boardName: {
+        type: "string",
+        description: "Exact name of an existing board to select.",
       },
       topic: {
         type: "string",
@@ -450,7 +459,7 @@ const plotWeatherHistoryDeclaration: FunctionDeclaration = {
 const generateImageDeclaration: FunctionDeclaration = {
   name: "generate_image",
   description:
-    "Generate a new image for the whiteboard. By default, make it look like a hand-drawn whiteboard doodle or marker sketch. Only make it realistic/photo-like when the user explicitly asks for realistic, photo, or photorealistic style. Use this for requests such as draw/show/create/generate a cat, dog, person, object, scene, or other visual that should be an image rather than a flowchart or simple text answer.",
+    "Generate a new image for the whiteboard. By default, make it look like a hand-drawn whiteboard doodle or marker sketch. Only make it realistic/photo-like when the user explicitly asks for realistic, photo, or photorealistic style. Use this for requests such as draw/show/create/generate a cat, dog, person, object, scene, or other visual that should be an image rather than a flowchart or simple text answer. If the user asks to explain and draw, include a fuller explanation; if they only ask to draw something, include a very short description of the subject.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -464,6 +473,11 @@ const generateImageDeclaration: FunctionDeclaration = {
         description:
           "Optional short title describing the generated image. Do not invent a title when none is useful.",
       },
+      explanation: {
+        type: "string",
+        description:
+          "If the user asks to explain and draw, provide a fuller concise description of the subject and its important parts. If the user only asks to draw or sketch something, provide a very short summary such as 'A simple sketch of a cat.'",
+      },
     },
     required: ["prompt"],
   },
@@ -472,7 +486,7 @@ const generateImageDeclaration: FunctionDeclaration = {
 const editBoardImageDeclaration: FunctionDeclaration = {
   name: "edit_board_image",
   description:
-    "Edit the CURRENT visible whiteboard image. By default, preserve or create a hand-drawn whiteboard doodle/marker-sketch look unless the user explicitly asks for realistic/photo style. Use this for visual follow-ups such as add a dog beside that cat, remove the tree, change its color, make the cat bigger, move it left, or otherwise modify an image already on the board. Preserve everything the user did not ask to change.",
+    "Edit the CURRENT visible whiteboard image. By default, preserve or create a hand-drawn whiteboard doodle/marker-sketch look unless the user explicitly asks for realistic/photo style. Use this for visual follow-ups such as add a dog beside that cat, remove the tree, change its color, make the cat bigger, move it left, or otherwise modify an image already on the board. Preserve everything the user did not ask to change. If the user asks to explain and draw, include a fuller explanation; if they only ask to draw, include a short description of the final result.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -485,6 +499,11 @@ const editBoardImageDeclaration: FunctionDeclaration = {
         type: "string",
         description:
           "Optional short title for the edited image/scene.",
+      },
+      explanation: {
+        type: "string",
+        description:
+          "If the user asks to explain and draw or describe the edited picture, provide a fuller concise description. If they only ask to draw or edit the image, provide a short summary such as 'A dog next to a cat.'",
       },
     },
     required: ["instruction"],
@@ -1038,6 +1057,23 @@ async function buildImageCommand(
       ? readString(args.instruction, "", 1200)
       : readString(args.prompt, "", 1200);
 
+  const wantsExplanation = /\b(explain|describe|tell me about|what is|what are|why|how does|show and explain)\b/i.test(requestedText);
+  const wantsDrawing = /\b(draw|sketch|create|generate|show|make|illustrate|picture)\b/i.test(requestedText);
+
+  const shortImageSummary = (() => {
+    const clean = requestedText
+      .replace(/\b(draw|sketch|create|generate|show|make|illustrate|picture|image|of)\b/gi, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const subject = clean
+      .replace(/^(a|an|the)\s+/i, "")
+      .replace(/[.!?]+$/g, "")
+      .trim();
+
+    return subject ? `A simple sketch of ${subject}.` : "A simple sketch.";
+  })();
+
   if (!requestedText) {
     throw new Error(
       mode === "edit"
@@ -1077,12 +1113,13 @@ async function buildImageCommand(
       ].join("\n")
     : [
         "Style: simple classroom whiteboard marker drawing.",
-        "Use bold clean dark marker outlines on a pure white background.",
+        "Use bold clean dark marker outlines with a transparent background, like an isolated PNG sticker.",
         "Prioritize a clear recognizable silhouette first, then add only a few important interior details.",
         "Make cartoon characters and animals easy to recognize from a distance.",
         "Use loose hand-drawn contours with occasional retraced lines, small overshoots, and slight wobble.",
         "Keep the drawing simple and readable: avoid tiny details, clutter, dense hatching, or broken fragmented lines.",
         "Do not use gradients, shadows, photographic texture, or large filled areas.",
+        "Never draw a background, floor, sky, scenery, setting, or white rectangle.",
         "Do not add text, labels, borders, watermarks, or a poster-like layout.",
         "The final result should look like a teacher quickly sketched it with a black dry-erase marker.",
       ].join("\n");
@@ -1097,9 +1134,11 @@ ${styleInstructions}
 
 Rules:
 - Preserve every existing element that the user did NOT ask to change.
+- Add only the requested new element; do not redraw the whole existing picture.
 - Keep the same overall 16:9 whiteboard composition.
 - Do not replace, restyle, or distort unrelated content.
 - If adding an object, place it naturally without covering important existing content.
+- Keep all empty areas transparent; do not add a background or white rectangle.
 - If the current board already looks hand-drawn, continue in the same whiteboard-doodle style unless the user explicitly asks for realistic style.
 - Do not add new text, labels, borders, watermarks, or captions unless explicitly requested.
 - Return only the edited image.
@@ -1116,7 +1155,7 @@ Rules:
 - Compose the subject clearly with comfortable margins so it looks good on a whiteboard.
 - Keep the subject large enough and visually simple enough to remain recognizable after whiteboard rendering.
 - Avoid unnecessary text, labels, frames, watermarks, or captions.
-- When the user does not explicitly request a background, setting, environment, or scene, draw only the requested subject as an isolated doodle on the plain whiteboard background. Do not add scenery, ground, sky, shadows, props, or decorative background elements.
+- Always draw only the requested subject as an isolated PNG-like doodle with a transparent background. Do not add scenery, ground, sky, shadows, props, or decorative background elements.
 - Include a background or setting only when the user's request explicitly names one, and then show only the requested subject together with that requested background.
 - Return only the generated image.
       `.trim();
@@ -1166,9 +1205,19 @@ Rules:
     generatedImagePart?.inlineData?.mimeType ||
     "image/png";
 
+  const explanationText = readString(args.explanation, "", 900);
+  const finalExplanation =
+    explanationText ||
+    (wantsDrawing
+      ? wantsExplanation
+        ? `${requestedText.replace(/[.!?]+$/g, "").trim()}. The drawing highlights the key parts clearly.`
+        : shortImageSummary
+      : "");
+
   return {
     type: "image",
     ...(title ? { title } : {}),
+    ...(finalExplanation ? { explanation: finalExplanation } : {}),
     imageDataUrl: `data:${mimeType};base64,${imageData}`,
     style: prefersRealistic ? "realistic" : "doodle",
     mode,
@@ -1204,6 +1253,25 @@ function serializeCurrentCommand(value: unknown): string {
   } catch {
     return "(none)";
   }
+}
+
+function serializeBoards(value: unknown): string {
+  if (!Array.isArray(value)) {
+    return "(none)";
+  }
+
+  const boards = value
+    .filter((board): board is Record<string, unknown> =>
+      Boolean(board && typeof board === "object"),
+    )
+    .map((board) => ({
+      id: readNumber(board.id, 0),
+      name: readString(board.name, "", 120),
+      content: readString(board.searchText, "", 1200),
+    }))
+    .filter((board) => board.id > 0 && board.name);
+
+  return boards.length > 0 ? JSON.stringify(boards) : "(none)";
 }
 
 export async function POST(request: Request) {
@@ -1250,6 +1318,7 @@ export async function POST(request: Request) {
       : null;
 
     const currentCommandValue = body.currentCommand;
+    const boards = serializeBoards(body.boards);
 
     const currentCommand = serializeCurrentCommand(
       currentCommandValue,
@@ -1268,14 +1337,18 @@ ROUTING RULES:
 - draw_flowchart: flowcharts, workflows, processes, decision trees, sequences with arrows.
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
 - generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
-- edit_board_image: modify a visual already visible on the board, for example "add a dog beside that cat", "remove the tree", or "make the cat bigger". By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
-- manage_board: create/add a new board, delete/remove the current board, or clear the current board. For create, include concise initial content in the same tool call.
+- edit_board_image: modify a visual already visible on the board, including a specific part of it, for example "change the leaf", "make the flower petals red", "add a dog beside that cat", "remove the tree", or "make the cat bigger". Use this for any follow-up that says change, edit, remove, add to, recolor, resize, move, or otherwise adjust something in the existing drawing. By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
+- If the user asks only to explain or describe the existing picture, use write_text and do not create or edit an image. Inspect the attached board image and explain what is visible.
+- If the user asks to explain and draw, explain with drawing, or describe and draw, use the image tool and include a fuller explanation field covering the subject and important parts.
+- If the user only says draw, sketch, create, or show something, still include a very short explanation field such as "A simple sketch of a cat." so the assistant can briefly describe the drawing after it is created.
+- manage_board: create/add a new board, select/open an existing board, delete/remove the current board, clear the current board, or restore content cleared earlier. Use restore when the user says redo, bring it back, undo the clear, or restore what was there before. For select, match the user's requested board by its name, ID, or content in the available board list, then return that board's boardId. For create, include concise initial content in the same tool call.
 
 BOARD CONTEXT:
 - The current structured board content is included below.
 - A current board screenshot may also be attached for follow-up context.
 - When a current board screenshot is attached, inspect it before answering. Pay attention to the user's hand-drawn circles, underlines, highlights, arrows, marks, and the object or text those marks point to. If the user asks what is inside, what something is, or what they pointed to, answer from the attached board image rather than guessing from structured text alone.
 - If the user says "it", "that", "this chart", "add", "change", "remove", "make it a bar chart", etc., use the existing board context and return the COMPLETE updated content through the appropriate tool.
+- For a follow-up that refers to an object or part of an existing image (for example "change the leaf" after drawing a flower), always use edit_board_image and keep the edit on the current board. Do not use generate_image for that follow-up.
 - If the user asks a clearly unrelated new question, replace the old topic with the new content.
 - Keep whiteboard content concise and readable.
 - For flowcharts, use row 0-5 and column 0-3 and avoid overlapping grid positions.
@@ -1328,6 +1401,9 @@ ANIMATION SPEED:
 
 Current structured board content:
 ${currentCommand}
+
+Available boards:
+${boards}
 
 User request:
 ${prompt}
@@ -1446,12 +1522,34 @@ ${prompt}
         ? (functionCall.args as Record<string, unknown>)
         : {};
 
+    const isAdditiveImageRequest =
+      Boolean(boardImagePart) &&
+      /\b(add|place|put|include|beside|next to|alongside)\b/i.test(prompt);
+
+    const shouldEditExistingImage =
+      functionCall.name === "edit_board_image" ||
+      (functionCall.name === "generate_image" && isAdditiveImageRequest);
+
+    const imageEditArgs =
+      functionCall.name === "generate_image" && isAdditiveImageRequest
+        ? {
+            ...args,
+            instruction: readString(args.prompt, prompt, 1200),
+          }
+        : args;
+
     let command: BoardCommand | TeacherLessonCommand | BoardManagementCommand;
 
     if (functionCall.name === "manage_board") {
       const action = readString(args.action, "", 20);
 
-      if (action !== "create" && action !== "delete" && action !== "clear") {
+      if (
+        action !== "create" &&
+        action !== "select" &&
+        action !== "delete" &&
+        action !== "clear" &&
+        action !== "restore"
+      ) {
         throw new Error("Gemini returned an invalid board management action.");
       }
 
@@ -1460,6 +1558,16 @@ ${prompt}
         action,
         ...(readString(args.topic, "", 120)
           ? { topic: readString(args.topic, "", 120) }
+          : {}),
+        ...(action === "select"
+          ? {
+              ...(readNumber(args.boardId, 0) > 0
+                ? { boardId: readNumber(args.boardId, 0) }
+                : {}),
+              ...(readString(args.boardName, "", 120)
+                ? { boardName: readString(args.boardName, "", 120) }
+                : {}),
+            }
           : {}),
         ...(action === "create"
           ? {
@@ -1492,7 +1600,7 @@ ${prompt}
       command = buildFlowchartCommand(args);
     } else if (functionCall.name === "plot_weather_history") {
       command = await buildWeatherChart(args);
-    } else if (functionCall.name === "generate_image") {
+    } else if (functionCall.name === "generate_image" && !shouldEditExistingImage) {
       command = await buildImageCommand(
         ai,
         args,
@@ -1500,10 +1608,10 @@ ${prompt}
         null,
         currentCommandValue,
       );
-    } else if (functionCall.name === "edit_board_image") {
+    } else if (shouldEditExistingImage) {
       command = await buildImageCommand(
         ai,
-        args,
+        imageEditArgs,
         "edit",
         boardImagePart,
         currentCommandValue,

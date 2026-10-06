@@ -269,6 +269,43 @@ function getBoardImageForGemini(
   return null;
 }
 
+function getBoardSearchText(board: Board): string {
+  const command = board.generatedCommand;
+
+  if (!command) {
+    return "";
+  }
+
+  if (command.type === "write_text") {
+    return [
+      command.title,
+      ...command.bullets,
+      ...(command.formulas ?? []),
+      command.note ?? "",
+    ].join(" ");
+  }
+
+  if (command.type === "flowchart") {
+    return [
+      command.title,
+      ...command.nodes.map((node) => node.label),
+      ...command.edges.map((edge) => edge.label ?? ""),
+    ].join(" ");
+  }
+
+  if (command.type === "chart") {
+    return [
+      command.title,
+      command.subtitle ?? "",
+      command.xAxisLabel ?? "",
+      command.yAxisLabel ?? "",
+      ...command.series.map((series) => series.label),
+    ].join(" ");
+  }
+
+  return command.title ?? "";
+}
+
 function estimateTextCommandLength(
   command: BoardCommand,
 ): number {
@@ -428,11 +465,15 @@ function buildSpokenResponse(command: BoardCommand): string {
   }
 
   if (command.type === "image") {
-    const subject = command.title?.trim() || "the requested drawing";
+    if (!command.explanation?.trim()) {
+      const title = command.title?.trim();
+      if (title) {
+        return `I have drawn ${title.toLowerCase()}.`;
+      }
+      return "I have drawn the image on the board.";
+    }
 
-    return command.mode === "edit"
-      ? `I have updated ${subject} on the whiteboard.`
-      : `I have drawn ${subject} on the whiteboard.`;
+    return command.explanation.trim();
   }
 
   return "I have updated the whiteboard.";
@@ -774,7 +815,7 @@ export default function LixiaStudio() {
 
   useEffect(() => {
     const command = activeBoard.generatedCommand;
-    if (!command || command.type === "teach_lesson") return;
+    if (!command) return;
     lastBoardCommandRef.current = command;
     const version = activeBoard.generatedCommandVersion;
     if (!version || lastBoardCueVersionRef.current === version) return;
@@ -1532,6 +1573,9 @@ export default function LixiaStudio() {
         board.id === activeBoardId
           ? {
               ...board,
+              previousDrawing: board.drawing,
+              previousGeneratedCommand: board.generatedCommand,
+              drawing: null,
               generatedCommand: null,
             }
           : board,
@@ -1541,6 +1585,22 @@ export default function LixiaStudio() {
     setClearSignal(
       (currentSignal) =>
         currentSignal + 1,
+    );
+  }
+
+  function restoreBoard() {
+    setBoards((currentBoards) =>
+      currentBoards.map((board) =>
+        board.id === activeBoardId
+          ? {
+              ...board,
+              drawing: board.previousDrawing ?? null,
+              generatedCommand: board.previousGeneratedCommand ?? null,
+              previousDrawing: null,
+              previousGeneratedCommand: null,
+            }
+          : board,
+      ),
     );
   }
 
@@ -1701,6 +1761,11 @@ export default function LixiaStudio() {
         body: JSON.stringify({
           prompt,
           currentCommand: targetBoard.generatedCommand,
+          boards: boards.map((board) => ({
+            id: board.id,
+            name: board.name,
+            searchText: getBoardSearchText(board),
+          })),
           boardImage: sendBoardImage
             ? boardImageForGemini
             : null,
@@ -1723,8 +1788,25 @@ export default function LixiaStudio() {
       if (data.management) {
         if (data.management.action === "clear") {
           clearBoard();
+        } else if (data.management.action === "restore") {
+          restoreBoard();
         } else if (data.management.action === "delete") {
           deleteBoard(targetBoardId);
+        } else if (data.management.action === "select") {
+          const requestedName = data.management.boardName?.trim().toLowerCase();
+          const requestedBoard = boards.find(
+            (board) =>
+              (data.management?.boardId !== undefined &&
+                board.id === data.management.boardId) ||
+              (requestedName !== undefined &&
+                board.name.toLowerCase() === requestedName),
+          );
+
+          if (!requestedBoard) {
+            throw new Error("I could not find that board.");
+          }
+
+          selectBoard(requestedBoard.id);
         } else {
           const newBoardId = addBoard();
           const newCommand: BoardCommand = {
@@ -1828,9 +1910,13 @@ export default function LixiaStudio() {
               command,
             )
           : command;
+        const isImageEdit =
+          command.type === "image" &&
+          command.mode === "edit";
       const needsNewBoard =
         targetBoard.generatedCommand !== null &&
-        !shouldAppend;
+          !shouldAppend &&
+          !isImageEdit;
       const commandTargetBoardId = needsNewBoard
         ? addBoard()
         : targetBoardId;
