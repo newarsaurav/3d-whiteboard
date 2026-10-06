@@ -35,6 +35,17 @@ import {
   resolveGesturePlan,
   shouldLookAtBoard,
 } from "@/lib/presentationGestures";
+import {
+  emotionForGesture,
+  MIKE_EMOTIONS,
+  normalizeEmotion,
+  type MikeEmotion,
+} from "@/lib/facialExpressions";
+import {
+  MIKE_REACTIONS,
+  normalizeReaction,
+  type MikeReaction,
+} from "@/lib/mikePresence";
 
 import PresentationBoard from "./PresentationBoard";
 import type {
@@ -48,7 +59,6 @@ type MikeModelComponent = ComponentType<{
   onMeasured?: (bounds: MikeBounds) => void;
   onReady?: (api: MikeAnimationApi) => void;
   lookTarget?: [number, number, number] | null;
-  lookStrength?: number;
 }>;
 
 import type {
@@ -65,7 +75,7 @@ const HIP_RATIO = 0.42;
 const BELOW_HIP_OFFSET = 0.25;
 const ABOVE_HEAD_OFFSET = 0.75;
 
-type CameraShot = "waist" | "full" | "close";
+type CameraShot = "waist" | "full" | "close" | "face";
 
 const CAMERA_FOV = 34;
 
@@ -133,6 +143,19 @@ function getShotPose(
     };
   }
 
+  if (shot === "face") {
+    // Head-and-shoulders portrait straight on, for the emotion lab.
+    const headY = bounds?.headY ?? 5.4;
+    const centerX = bounds?.centerX ?? -3.1;
+    const centerZ = bounds?.centerZ ?? 1.0;
+    const eyeY = headY - 0.36;
+    const distance = 2.9;
+    return {
+      position: new THREE.Vector3(centerX + 0.2, eyeY + 0.05, centerZ + distance),
+      target: new THREE.Vector3(centerX + 0.05, eyeY - 0.08, centerZ),
+    };
+  }
+
   if (shot === "close") {
     if (!bounds) {
       return {
@@ -183,8 +206,16 @@ function CameraShotController({
     arrivingRef.current = true;
   }, [shotKey]);
 
-  useFrame((_, delta) => {
+  const timerRef = useRef<THREE.Timer | null>(null);
+
+  useFrame(() => {
     if (!arrivingRef.current) return;
+
+    if (!timerRef.current) {
+      timerRef.current = new THREE.Timer();
+    }
+    timerRef.current.update();
+    const delta = timerRef.current.getDelta();
 
     const blend = 1 - Math.exp(-delta * 6);
     camera.position.lerp(pose.position, blend);
@@ -495,6 +526,10 @@ export default function LixiaStudio() {
   const teacherAudioContextRef =
     useRef<AudioContext | null>(null);
 
+  // TTS audio flows through this analyser so Mike's mouth can follow it.
+  const teacherAnalyserRef =
+    useRef<AnalyserNode | null>(null);
+
   const teacherAbortControllerRef =
     useRef<AbortController | null>(null);
 
@@ -505,10 +540,12 @@ export default function LixiaStudio() {
     useRef<MikeAnimationApi | null>(null);
   const activeSpeechMotionRef =
     useRef<MikeSpeakingOptions | null>(null);
+  const cameraShotRef = useRef<CameraShot>("waist");
 
   const handleMikeReady = useCallback(
     (api: MikeAnimationApi) => {
       mikeApiRef.current = api;
+      api.setPerformanceShot(cameraShotRef.current);
       const activeSpeech = activeSpeechMotionRef.current;
       if (activeSpeech) {
         api.setSpeaking(true, activeSpeech);
@@ -529,11 +566,61 @@ export default function LixiaStudio() {
   const [cameraShot, setCameraShot] =
     useState<CameraShot>("waist");
 
+  useEffect(() => {
+    cameraShotRef.current = cameraShot;
+    mikeApiRef.current?.setPerformanceShot(cameraShot);
+  }, [cameraShot]);
+
   const [cameraFollow, setCameraFollow] =
     useState(true);
 
-  const [lookStrength, setLookStrength] =
-    useState(0);
+  // Emotion lab: preview each facial preset (and lipsync) on a close-up.
+  const [emotionLabOpen, setEmotionLabOpen] = useState(false);
+  const [labEmotion, setLabEmotion] = useState<MikeEmotion>("attentive");
+  const [labTalking, setLabTalking] = useState(false);
+
+  function openEmotionLab() {
+    setEmotionLabOpen(true);
+    setCameraFollow(false);
+    setCameraShot("face");
+  }
+
+  function closeEmotionLab() {
+    setEmotionLabOpen(false);
+    setLabTalking(false);
+    setLabListening(false);
+    mikeApiRef.current?.setListening(false);
+    mikeApiRef.current?.setIdleMode("rest");
+    mikeApiRef.current?.setLipsync(null);
+    mikeApiRef.current?.setEmotion("attentive");
+    setLabEmotion("attentive");
+    setCameraFollow(true);
+    setCameraShot("waist");
+  }
+
+  function previewEmotion(emotion: MikeEmotion) {
+    setLabEmotion(emotion);
+    mikeApiRef.current?.setEmotion(emotion);
+  }
+
+  function toggleLabTalking() {
+    const next = !labTalking;
+    setLabTalking(next);
+    mikeApiRef.current?.setLipsync(next ? { kind: "synthetic" } : null);
+  }
+
+  const [labListening, setLabListening] = useState(false);
+
+  function previewReaction(kind: MikeReaction) {
+    mikeApiRef.current?.playReaction(kind);
+  }
+
+  function toggleLabListening() {
+    const next = !labListening;
+    setLabListening(next);
+    mikeApiRef.current?.setListening(next);
+    mikeApiRef.current?.setIdleMode(next ? "listen" : "rest");
+  }
 
   const [mikeBounds, setMikeBounds] =
     useState<MikeBounds | null>(null);
@@ -654,10 +741,36 @@ export default function LixiaStudio() {
   useEffect(() => {
     if (!isGenerating && !isTeaching) {
       mikeApiRef.current?.setIdleMode("rest");
-      mikeApiRef.current?.setLookAtBoard(false);
-      setLookStrength(0);
+      mikeApiRef.current?.setGaze("camera");
     }
   }, [isGenerating, isTeaching]);
+
+  // Listening: while the user types Mike attends to them; while Lixia is
+  // generating he visibly thinks. Both are hands-at-rest stances.
+  const isTyping =
+    assistantPrompt.trim().length > 0 && !isTeaching && !isGenerating;
+  useEffect(() => {
+    const mike = mikeApiRef.current;
+    if (!mike || emotionLabOpen) return;
+    if (isGenerating) {
+      mike.setListening(true);
+      mike.setIdleMode("think");
+      mike.setEmotion("thinking");
+      mike.setGaze("camera");
+      return;
+    }
+    if (isTyping) {
+      mike.setListening(true);
+      mike.setIdleMode("listen");
+      mike.setEmotion("attentive");
+      mike.setGaze("camera");
+      return;
+    }
+    mike.setListening(false);
+    if (!isTeaching && mike.currentEmotion() === "thinking") {
+      mike.setEmotion("attentive");
+    }
+  }, [isGenerating, isTyping, isTeaching, emotionLabOpen]);
 
   useEffect(() => {
     const command = activeBoard.generatedCommand;
@@ -666,10 +779,23 @@ export default function LixiaStudio() {
     const version = activeBoard.generatedCommandVersion;
     if (!version || lastBoardCueVersionRef.current === version) return;
     lastBoardCueVersionRef.current = version;
-    if (cameraFollowRef.current) {
-      applyAutoShot("full");
-    }
   }, [activeBoard]);
+
+  /**
+   * Auto camera picks ONE shot per response and holds it. Cutting between
+   * waist/full/close on every segment read as jittery, so the decision is
+   * made once from the response's intents: anything that points at the
+   * board gets the full shot, otherwise the tuned waist shot.
+   */
+  function shotForResponse(
+    intents: Array<string | null | undefined>,
+  ): CameraShot {
+    for (const intent of intents) {
+      const shot = cameraShotForIntent(intent);
+      if (shot === "full") return "full";
+    }
+    return "waist";
+  }
 
   function getTeacherAudioContext(): AudioContext | null {
     if (typeof window === "undefined") {
@@ -680,10 +806,15 @@ export default function LixiaStudio() {
       !teacherAudioContextRef.current ||
       teacherAudioContextRef.current.state === "closed"
     ) {
-      teacherAudioContextRef.current =
-        new window.AudioContext({
-          sampleRate: 24000,
-        });
+      const context = new window.AudioContext({
+        sampleRate: 24000,
+      });
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 1024;
+      analyser.smoothingTimeConstant = 0.35;
+      analyser.connect(context.destination);
+      teacherAudioContextRef.current = context;
+      teacherAnalyserRef.current = analyser;
     }
 
     return teacherAudioContextRef.current;
@@ -718,12 +849,12 @@ export default function LixiaStudio() {
     setIsTeachingPaused(false);
     activeSpeechMotionRef.current = null;
     mikeApiRef.current?.setPaused(false);
+    mikeApiRef.current?.setLipsync(null);
     mikeApiRef.current?.setSpeaking(false);
-    mikeApiRef.current?.setLookAtBoard(false);
+    mikeApiRef.current?.setGaze("camera");
     mikeApiRef.current?.setIdleMode("rest");
+    mikeApiRef.current?.setEmotion("attentive");
     mikeApiRef.current?.playWaiting();
-    setLookStrength(0);
-    applyAutoShot("waist");
   }
 
   async function pauseTeaching() {
@@ -795,6 +926,9 @@ export default function LixiaStudio() {
     narration = "",
     fallbackIndex = 0,
     durationSeconds = estimateSpeechSeconds(narration),
+    emotion?: string | null,
+    voice: "tts" | "browser" = "tts",
+    reaction?: string | null,
   ) {
     if (runId !== teachingRunRef.current) return;
     const plan = resolveGesturePlan(gestureIntent, fallbackIndex);
@@ -802,14 +936,31 @@ export default function LixiaStudio() {
       preferredAnimationId: plan.animationId,
       estimatedDurationSec: durationSeconds,
       forcePreferred: true,
-      lookAtBoard: shouldLookAtBoard(plan.intent),
+      lookAtBoard: false,
+      gestureless: plan.rest,
+      gestureWeight: plan.weight,
+      shot: cameraShot,
+      gestureIntent: plan.intent,
     };
     activeSpeechMotionRef.current = options;
-    setLookStrength(shouldLookAtBoard(plan.intent) ? 0.4 : 0.24);
-    applyAutoShot(cameraShotForIntent(plan.intent));
+    mikeApiRef.current?.setListening(false);
+    mikeApiRef.current?.setEmotion(
+      normalizeEmotion(emotion) ?? emotionForGesture(plan.intent),
+    );
+    const beat = normalizeReaction(reaction);
+    if (beat) mikeApiRef.current?.playReaction(beat);
+    const analyser = teacherAnalyserRef.current;
+    mikeApiRef.current?.setLipsync(
+      voice === "tts" && analyser
+        ? { kind: "analyser", node: analyser }
+        : { kind: "synthetic" },
+    );
     mikeApiRef.current?.setSpeaking(true, options);
+    // Eye contact by default; a short glance at the board when the line
+    // refers to it, then back to the viewer.
+    mikeApiRef.current?.setGaze("camera");
     if (shouldLookAtBoard(plan.intent)) {
-      mikeApiRef.current?.setLookAtBoard(true, 0.4);
+      mikeApiRef.current?.glanceAtBoard(Math.min(2.6, durationSeconds * 0.5));
     }
   }
 
@@ -828,18 +979,21 @@ export default function LixiaStudio() {
       preferredAnimationId: plan.animationId,
       estimatedDurationSec: durationSeconds,
       forcePreferred: true,
-      lookAtBoard: shouldLookAtBoard(plan.intent),
+      lookAtBoard: false,
+      gestureless: plan.rest,
+      gestureWeight: plan.weight,
+      shot: cameraShot,
+      gestureIntent: plan.intent,
     });
   }
 
   function stopSpeechMotion(runId: number) {
     if (runId !== teachingRunRef.current) return;
     activeSpeechMotionRef.current = null;
+    mikeApiRef.current?.setLipsync(null);
     mikeApiRef.current?.setSpeaking(false);
-    mikeApiRef.current?.setLookAtBoard(false);
+    mikeApiRef.current?.setGaze("camera");
     mikeApiRef.current?.playWaiting();
-    setLookStrength(0);
-    applyAutoShot("waist");
   }
 
   async function speakTeachingSegmentFallback(
@@ -848,6 +1002,8 @@ export default function LixiaStudio() {
     runId: number,
     gestureIntent?: string | null,
     fallbackIndex = 0,
+    emotion?: string | null,
+    reaction?: string | null,
   ): Promise<void> {
     const estimatedDuration = estimateSpeechSeconds(text);
     void prepareSpeechMotion(
@@ -895,6 +1051,9 @@ export default function LixiaStudio() {
           text,
           fallbackIndex,
           estimatedDuration,
+          emotion,
+          "browser",
+          reaction,
         );
       };
       utterance.onend = finish;
@@ -909,6 +1068,8 @@ export default function LixiaStudio() {
     runId: number,
     gestureIntent?: string | null,
     fallbackIndex = 0,
+    emotion?: string | null,
+    reaction?: string | null,
   ): Promise<void> {
     if (!text.trim() || runId !== teachingRunRef.current) {
       return;
@@ -932,6 +1093,8 @@ export default function LixiaStudio() {
         runId,
         gestureIntent,
         fallbackIndex,
+        emotion,
+        reaction,
       );
       return;
     }
@@ -1039,7 +1202,9 @@ export default function LixiaStudio() {
 
         const source = audioContext.createBufferSource();
         source.buffer = audioBuffer;
-        source.connect(audioContext.destination);
+        source.connect(
+          teacherAnalyserRef.current ?? audioContext.destination,
+        );
 
         teacherAudioSourcesRef.current.add(source);
 
@@ -1068,6 +1233,9 @@ export default function LixiaStudio() {
               text,
               fallbackIndex,
               speechMotionDuration,
+              emotion,
+              "tts",
+              reaction,
             );
           }, delayMs);
         }
@@ -1099,6 +1267,8 @@ export default function LixiaStudio() {
         runId,
         gestureIntent,
         fallbackIndex,
+        emotion,
+        reaction,
       );
     } finally {
       stopSpeechMotion(runId);
@@ -1129,7 +1299,7 @@ export default function LixiaStudio() {
     setIsTeaching(true);
     setIsTeachingPaused(false);
     setCameraFollow(true);
-    applyAutoShot("full");
+    applyAutoShot(shotForResponse([gestureForBoardCommand(command)]));
 
     const audioContext = getTeacherAudioContext();
 
@@ -1163,6 +1333,7 @@ export default function LixiaStudio() {
         setIsTeaching(false);
         setIsTeachingPaused(false);
         stopSpeechMotion(runId);
+        mikeApiRef.current?.setEmotion("attentive");
       }
     }
   }
@@ -1177,10 +1348,6 @@ export default function LixiaStudio() {
         boardRenderWaitersRef.current.delete(key);
         resolve();
       }
-
-      if (activeSpeechMotionRef.current) return;
-      applyAutoShot("waist");
-      setLookStrength(0);
     },
     [],
   );
@@ -1229,7 +1396,9 @@ export default function LixiaStudio() {
     setIsTeaching(true);
     setIsTeachingPaused(false);
     setCameraFollow(true);
-    applyAutoShot("full");
+    applyAutoShot(
+      shotForResponse(lesson.segments.map((segment) => segment.gesture)),
+    );
 
     const audioContext = getTeacherAudioContext();
 
@@ -1301,6 +1470,8 @@ export default function LixiaStudio() {
           runId,
           gestureIntent,
           segmentIndex,
+          segment.emotion,
+          segment.reaction,
         );
 
 // <!--         conflict changed 
@@ -1321,6 +1492,7 @@ export default function LixiaStudio() {
         setIsTeaching(false);
         setIsTeachingPaused(false);
         stopSpeechMotion(runId);
+        mikeApiRef.current?.setEmotion("attentive");
       }
     }
   }
@@ -1730,6 +1902,17 @@ export default function LixiaStudio() {
 
           <button
             type="button"
+            className={emotionLabOpen ? "primary" : undefined}
+            onClick={() =>
+              emotionLabOpen ? closeEmotionLab() : openEmotionLab()
+            }
+            title="Preview Mike's facial emotions"
+          >
+            {emotionLabOpen ? "Close Emotions" : "Emotions"}
+          </button>
+
+          <button
+            type="button"
             onClick={addBoard}
           >
             New Board
@@ -1875,6 +2058,81 @@ export default function LixiaStudio() {
           </button>
         </div>
 
+        {emotionLabOpen && (
+          <div className="emotion-lab" aria-label="Emotion preview">
+            <div className="emotion-lab-title">
+              <strong>Emotion lab</strong>
+              <span>{labEmotion}</span>
+            </div>
+            <div className="emotion-lab-grid">
+              {MIKE_EMOTIONS.map((emotion) => (
+                <button
+                  key={emotion}
+                  type="button"
+                  className={
+                    labEmotion === emotion
+                      ? "emotion-lab-button active"
+                      : "emotion-lab-button"
+                  }
+                  onClick={() => previewEmotion(emotion)}
+                >
+                  {emotion}
+                </button>
+              ))}
+            </div>
+            <div className="emotion-lab-row" aria-label="Reactions">
+              {MIKE_REACTIONS.map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  className="emotion-lab-button"
+                  onClick={() => previewReaction(kind)}
+                >
+                  {kind}
+                </button>
+              ))}
+              <button
+                type="button"
+                className={
+                  labListening
+                    ? "emotion-lab-button active"
+                    : "emotion-lab-button"
+                }
+                onClick={toggleLabListening}
+              >
+                {labListening ? "Stop listening" : "Listening"}
+              </button>
+            </div>
+            <div className="emotion-lab-row">
+              <button
+                type="button"
+                className={
+                  labTalking
+                    ? "emotion-lab-button active"
+                    : "emotion-lab-button"
+                }
+                onClick={toggleLabTalking}
+              >
+                {labTalking ? "Stop talking" : "Talk (lipsync)"}
+              </button>
+              <button
+                type="button"
+                className={
+                  cameraShot === "face"
+                    ? "emotion-lab-button active"
+                    : "emotion-lab-button"
+                }
+                onClick={() => {
+                  setCameraFollow(false);
+                  setCameraShot(cameraShot === "face" ? "waist" : "face");
+                }}
+              >
+                {cameraShot === "face" ? "Waist view" : "Face close-up"}
+              </button>
+            </div>
+          </div>
+        )}
+
         <div className="mode-label">
           {cameraMode
             ? "Camera Mode"
@@ -1883,9 +2141,11 @@ export default function LixiaStudio() {
             ? " · Auto"
             : cameraShot === "close"
               ? " · Close"
-              : cameraShot === "waist"
-                ? " · Waist"
-                : " · Full"}
+              : cameraShot === "face"
+                ? " · Face"
+                : cameraShot === "waist"
+                  ? " · Waist"
+                  : " · Full"}
         </div>
 
         <div
@@ -2117,7 +2377,6 @@ export default function LixiaStudio() {
                 boardLayout.y + boardLayout.frameHeight * 0.16,
                 BOARD_Z,
               ]}
-              lookStrength={lookStrength}
             />
           ) : null}
           <PresentationBoard

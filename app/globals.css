@@ -940,6 +940,84 @@ input {
   backdrop-filter: blur(10px);
 }
 
+.emotion-lab {
+  position: absolute;
+  top: 64px;
+  left: 18px;
+  z-index: 35;
+
+  width: 300px;
+  padding: 12px;
+
+  display: grid;
+  gap: 10px;
+
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 16px;
+
+  background: rgba(12, 16, 27, 0.94);
+  color: #ffffff;
+
+  box-shadow:
+    0 18px 45px rgba(0, 0, 0, 0.4);
+
+  backdrop-filter: blur(16px);
+}
+
+.emotion-lab-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  font-size: 13px;
+}
+
+.emotion-lab-title span {
+  color: #a78bfa;
+  font-size: 12px;
+  text-transform: capitalize;
+}
+
+.emotion-lab-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.emotion-lab-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.emotion-lab-row[aria-label="Reactions"] {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.emotion-lab-button {
+  height: 34px;
+  padding: 0 10px;
+
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9px;
+
+  background: #1b2131;
+  color: #ffffff;
+  font-size: 12px;
+  text-transform: capitalize;
+  cursor: pointer;
+}
+
+.emotion-lab-button:hover {
+  background: #2a3247;
+}
+
+.emotion-lab-button.active {
+  border-color: #a78bfa;
+  background: #6d28d9;
+}
+
 .lixia-assistant-panel {
   position: absolute;
   left: 18px;
