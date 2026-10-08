@@ -1155,7 +1155,7 @@ Rules:
 - ${prefersRealistic ? "Preserve the existing background treatment." : "Use an opaque pure-white background; do not leave transparent areas."}
 - If the current board already looks hand-drawn, continue in the same whiteboard-doodle style unless the user explicitly asks for realistic style.
 - Do not add new text, labels, borders, watermarks, captions, logos, signatures, or board names unless the user explicitly requests that exact content.
-- Return only the edited image as PNG. The result may contain only the requested addition and its minimal supporting visual details.
+- Return the COMPLETE updated board as PNG, including all existing content and the requested addition. Do not return only a partial overlay or a standalone new object.
       `.trim()
       : `
 Create an image for display on a 16:9 interactive teaching whiteboard.

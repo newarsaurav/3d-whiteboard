@@ -1753,6 +1753,31 @@ function createAdditiveImageLayer(
   return layer;
 }
 
+function hasVisibleImagePixels(canvas: HTMLCanvasElement): boolean {
+  const context = canvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+
+  if (!context) {
+    return false;
+  }
+
+  const pixels = context.getImageData(
+    0,
+    0,
+    canvas.width,
+    canvas.height,
+  ).data;
+
+  for (let index = 3; index < pixels.length; index += 4) {
+    if (pixels[index] > 24) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function deterministicStrokeJitter(seed: number): number {
   const value = Math.sin(seed * 12.9898 + 78.233) * 43758.5453;
   return (value - Math.floor(value)) * 2 - 1;
@@ -3261,6 +3286,12 @@ export default function PresentationBoard({
               baseCanvas,
               fittedImage,
             );
+
+            if (
+              !hasVisibleImagePixels(additiveImageLayer)
+            ) {
+              additiveImageLayer = null;
+            }
           }
         }
 
