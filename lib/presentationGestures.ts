@@ -13,7 +13,105 @@ export type GesturePlan = {
   animationId: string;
   layer: GestureLayer;
   pool: string[];
+  /** True when the line should be spoken with the hands at rest. */
+  rest: boolean;
+  /** Mixer weight multiplier: soft explaining < 1 < strong emphasis. */
+  weight: number;
 };
+
+/** Intents that mean "talk, no gesture". */
+export const REST_INTENTS = new Set(["none", "rest", "continue", "talk", "plain"]);
+
+/**
+ * How hard each intent should hit. 1.0 is the baseline explaining hand;
+ * emphasis and pointing are stronger, listening/thinking softer.
+ */
+const GESTURE_WEIGHT_BY_INTENT: Record<string, number> = {
+  emphasize: 1.5,
+  point: 1.5,
+  reveal: 1.3,
+  contrast: 1.25,
+  welcome: 1.3,
+  wave: 1.3,
+  goodbye: 1.25,
+  approve: 1.2,
+  idea: 1.2,
+  next: 1.1,
+  explain: 1.0,
+  offer: 0.9,
+  together: 0.9,
+  agree: 0.85,
+  disagree: 0.9,
+  thanks: 0.9,
+  ready: 1.0,
+  think: 0.75,
+  listen: 0.7,
+  uncertain: 0.8,
+  confused: 0.8,
+};
+
+export function gestureWeightForIntent(intent: string): number {
+  return GESTURE_WEIGHT_BY_INTENT[intent] ?? 1;
+}
+
+export type PerformanceShot = "waist" | "full" | "close" | "face";
+
+/**
+ * How large the hands should play for the current camera. Close-ups keep
+ * the motion in-frame; the full shot can afford a slightly bigger beat.
+ */
+export function gestureScaleForShot(
+  shot?: PerformanceShot | null,
+): number {
+  switch (shot) {
+    case "face":
+      return 0.36;
+    case "close":
+      return 0.5;
+    case "full":
+      return 1.12;
+    default:
+      return 1;
+  }
+}
+
+/** Soft upper-body holds the arms settle into after a gesture. */
+export const REST_POSES = [
+  { id: "seg_504", name: "rest-palms", weight: 0.4 },
+  { id: "seg_427", name: "rest-clasp", weight: 0.36 },
+  { id: "seg_456", name: "rest-offer", weight: 0.34 },
+] as const;
+
+export type RestPose = (typeof REST_POSES)[number];
+
+const REST_AFTER_INTENT: Record<string, RestPose["id"]> = {
+  point: "seg_504",
+  explain: "seg_504",
+  emphasize: "seg_504",
+  contrast: "seg_504",
+  reveal: "seg_456",
+  offer: "seg_456",
+  welcome: "seg_456",
+  wave: "seg_456",
+  think: "seg_427",
+  listen: "seg_427",
+  uncertain: "seg_427",
+  confused: "seg_427",
+};
+
+export function pickRestPose(
+  lastRestId?: string | null,
+  intent?: string | null,
+): RestPose {
+  const preferred = intent ? REST_AFTER_INTENT[intent] : undefined;
+  const choices = REST_POSES.filter((pose) => pose.id !== lastRestId);
+  const pool = choices.length > 0 ? choices : [...REST_POSES];
+  if (preferred) {
+    const match = pool.find((pose) => pose.id === preferred);
+    if (match) return match;
+  }
+  return pool[Math.floor(Math.random() * pool.length)] ?? REST_POSES[0];
+}
 
 export const DEFAULT_GESTURE_INTENT = "explain";
 
@@ -72,6 +170,19 @@ export const GESTURE_BY_INTENT: Record<
     { animationId: spec.ids[0], layer: spec.layer },
   ]),
 );
+
+/** Neutral rest plan: speak with the hands down. */
+function restPlan(): GesturePlan {
+  const spec = GESTURE_POOLS.explain;
+  return {
+    intent: "none",
+    animationId: spec.ids[0],
+    layer: spec.layer,
+    pool: spec.ids,
+    rest: true,
+    weight: 0,
+  };
+}
 
 /** Gemini sometimes invents close cousins of real intents. */
 const INTENT_ALIASES: Record<string, string> = {
@@ -152,7 +263,8 @@ export function normalizeGestureIntent(
   const raw = String(intent || "")
     .trim()
     .toLowerCase();
-  if (!raw || raw === "continue") return null;
+  if (!raw) return null;
+  if (REST_INTENTS.has(raw)) return "none";
   return INTENT_ALIASES[raw] ?? raw;
 }
 
@@ -165,6 +277,10 @@ export function resolveGesturePlan(
   fallbackIndex = 0,
 ): GesturePlan {
   const normalized = normalizeGestureIntent(intent);
+  if (normalized === "none") {
+    return restPlan();
+  }
+
   if (normalized === "idle") {
     const spec = GESTURE_POOLS.idle;
     return {
@@ -172,6 +288,8 @@ export function resolveGesturePlan(
       animationId: spec.ids[0],
       layer: spec.layer,
       pool: spec.ids,
+      rest: true,
+      weight: 0,
     };
   }
 
@@ -182,6 +300,8 @@ export function resolveGesturePlan(
       animationId: pickPoolId(normalized, spec.ids, fallbackIndex),
       layer: spec.layer,
       pool: spec.ids,
+      rest: false,
+      weight: gestureWeightForIntent(normalized),
     };
   }
 
@@ -201,6 +321,8 @@ export function resolveGesturePlan(
     animationId: pickPoolId(fallback, spec.ids, fallbackIndex),
     layer: spec.layer,
     pool: spec.ids,
+    rest: false,
+    weight: gestureWeightForIntent(fallback),
   };
 }
 

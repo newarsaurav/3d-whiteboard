@@ -64,6 +64,15 @@ export interface TeacherLessonSegment {
   // e.g. "explain", "emphasize", "point"). Optional — the studio
   // falls back to a rotation of teaching gestures when absent.
   gesture?: string;
+
+  // Facial expression Mike wears while this segment is narrated
+  // (e.g. "happy", "surprised", "serious", "thinking"). Optional — the
+  // studio derives a mild one from the gesture when absent.
+  emotion?: string;
+
+  // Optional short physical reaction at the start of the segment
+  // ("laugh", "hm", "surprise", "nod", "shrug"). Most segments omit it.
+  reaction?: string;
 }
 
 export interface TeacherLessonCommand {

@@ -2,6 +2,7 @@ import {
   FunctionCallingConfigMode,
   GoogleGenAI,
   type FunctionDeclaration,
+  type GenerateContentConfig,
   type Part,
 } from "@google/genai";
 import { NextResponse } from "next/server";
@@ -57,6 +58,58 @@ interface WeatherResponse {
 
 const MAX_PROMPT_LENGTH = 3000;
 const MAX_CONTEXT_LENGTH = 18000;
+
+const GEMINI_TEXT_MODELS = uniqueModels([
+  "gemini-3.1-flash-lite",
+  process.env.GEMINI_MODEL,
+  "gemini-3.5-flash-lite",
+  "gemini-flash-lite-latest",
+  "gemini-3.5-flash",
+  "gemini-3.6-flash",
+]);
+
+function uniqueModels(models: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const names: string[] = [];
+  for (const model of models) {
+    const name = model?.trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    names.push(name);
+  }
+  return names;
+}
+
+function isRetryableGeminiError(error: unknown): boolean {
+  const status = Number((error as { status?: number })?.status);
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    status === 503 ||
+    status === 429 ||
+    status === 404 ||
+    /UNAVAILABLE|high demand|overloaded|try again later|resource exhausted|no longer available|NOT_FOUND/i.test(
+      message,
+    )
+  );
+}
+
+function isGeminiUnavailable(error: unknown): boolean {
+  const status = Number((error as { status?: number })?.status);
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    status === 503 ||
+    status === 429 ||
+    /UNAVAILABLE|high demand|overloaded|try again later|resource exhausted/i.test(
+      message,
+    )
+  );
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 const writeTextDeclaration: FunctionDeclaration = {
   name: "write_text",
@@ -240,6 +293,7 @@ const teachLessonDeclaration: FunctionDeclaration = {
             gesture: {
               type: "string",
               enum: [
+                "none",
                 "continue",
                 "wave",
                 "goodbye",
@@ -265,7 +319,30 @@ const teachLessonDeclaration: FunctionDeclaration = {
                 "together",
               ],
               description:
-                "Body gesture Mike performs while speaking this segment. Pick the one matching the narration's intent: 'welcome' or 'ready' to open a lesson, 'explain' for how something works, 'emphasize' for key points, 'point' when directing attention to the board, 'reveal' for results, 'contrast' for however/alternatives, 'next' when moving to a new part, 'approve' for praise, 'goodbye' to close. Use 'continue' when no distinct gesture fits.",
+                "Body gesture Mike performs while speaking this segment. Pick the one matching the narration's intent: 'welcome' or 'ready' to open a lesson, 'explain' for how something works, 'emphasize' for key points, 'point' when directing attention to the board, 'reveal' for results, 'contrast' for however/alternatives, 'next' when moving to a new part, 'approve' for praise, 'goodbye' to close. Use 'none' when Mike should simply talk with his hands at rest (transitions, short conversational lines, follow-up sentences that continue a thought). Real presenters gesture on roughly two thirds of what they say, so about one segment in three should be 'none'.",
+            },
+            emotion: {
+              type: "string",
+              enum: [
+                "neutral",
+                "attentive",
+                "happy",
+                "encouraging",
+                "amused",
+                "surprised",
+                "thinking",
+                "concerned",
+                "serious",
+                "angry",
+              ],
+              description:
+                "Facial expression Mike wears while speaking this segment. 'encouraging' for openings and praise, 'happy' for good news or a correct idea, 'amused' for a light joke or fun fact, 'surprised' for a striking result or counter-intuitive fact, 'thinking' when posing a question or working through a step, 'concerned' for a common mistake or pitfall, 'serious' for a key rule or warning, 'angry' only when the lesson content itself calls for it. Use 'attentive' for plain explanation.",
+            },
+            reaction: {
+              type: "string",
+              enum: ["none", "laugh", "hm", "surprise", "nod", "shrug"],
+              description:
+                "Optional short physical reaction right before this segment: 'laugh' for a joke or fun aside, 'hm' when pausing to think, 'surprise' for a striking fact, 'nod' to affirm the student, 'shrug' for 'it depends' / nobody knows. Most segments should be 'none' or omitted; at most one or two reactions per lesson.",
             },
           },
           required: ["narration", "boardTitle", "boardBullets"],
@@ -591,10 +668,16 @@ function buildTeacherLessonCommand(
 
       const gesture = readString(segment.gesture, "", 24)
         .toLowerCase();
+      const emotion = readString(segment.emotion, "", 24)
+        .toLowerCase();
+      const reaction = readString(segment.reaction, "", 24)
+        .toLowerCase();
 
       return {
         narration,
         ...(gesture ? { gesture } : {}),
+        ...(emotion ? { emotion } : {}),
+        ...(reaction && reaction !== "none" ? { reaction } : {}),
         board: {
           type: "write_text" as const,
           title: readString(
@@ -1099,8 +1182,6 @@ Rules:
     ],
     config: {
       responseModalities: ["IMAGE"],
-      // `responseFormat` is not part of GenerateContentConfig in
-      // @google/genai; aspect ratio goes through imageConfig.
       imageConfig: {
         aspectRatio: "16:9",
       },
@@ -1287,6 +1368,9 @@ BOARD CONTEXT:
 - For formulas, put symbolic notation on the board, but phrase the narration naturally. Example: board shows "a = Δv / Δt" while narration says "acceleration equals change in velocity divided by change in time."
 - Prefer 3-5 lesson segments so the learner sees the board develop step by step.
 - For teach_lesson, give every segment a gesture that matches its narration. Vary the gestures across the lesson: typically open with welcome/ready, use explain/point/emphasize in the middle, and end with approve/goodbye. Do not repeat the same gesture in consecutive segments unless it clearly fits.
+- Not every line needs a gesture. Roughly one segment in three should use gesture "none": transitions, short conversational lines, and sentences that just continue the previous thought. Save point/emphasize/reveal for the moments that matter so they land.
+- For teach_lesson, also give every segment an emotion that matches the tone of its narration. Most segments are 'attentive'; open with 'encouraging'; use 'surprised' for a striking or counter-intuitive fact, 'thinking' when posing a question, 'concerned' for a common mistake, 'serious' for a rule that must not be broken, 'amused' for a light aside, and 'happy' when celebrating a result. Do not use 'angry' unless the content itself is about anger or the user asks for it.
+- A segment may also carry a reaction ('laugh', 'hm', 'surprise', 'nod', 'shrug'): a short physical beat before Mike speaks it. Use these sparingly, one or two per lesson at most, where a human teacher would visibly react: a chuckle before a fun aside, a 'hm' before a tricky question, a 'surprise' before a striking fact.
 
 FONT MANAGEMENT:
 - Default font is "sans-serif" - a clean, modern font suitable for most content.
@@ -1339,39 +1423,80 @@ ${prompt}
     parts.push({ text: routerInstructions });
 
     const ai = new GoogleGenAI({ apiKey });
-
-    const response = await ai.models.generateContent({
-      model:
-        process.env.GEMINI_MODEL ??
-        "gemini-3.5-flash-lite",
-      contents: [
+    const generateConfig: GenerateContentConfig = {
+      temperature: 0.1,
+      tools: [
         {
-          role: "user",
-          parts,
+          functionDeclarations: [
+            writeTextDeclaration,
+            manageBoardDeclaration,
+            teachLessonDeclaration,
+            drawFlowchartDeclaration,
+            plotWeatherHistoryDeclaration,
+            generateImageDeclaration,
+            editBoardImageDeclaration,
+          ],
         },
       ],
-      config: {
-        temperature: 0.1,
-        tools: [
-          {
-            functionDeclarations: [
-              writeTextDeclaration,
-              manageBoardDeclaration,
-              teachLessonDeclaration,
-              drawFlowchartDeclaration,
-              plotWeatherHistoryDeclaration,
-              generateImageDeclaration,
-              editBoardImageDeclaration,
-            ],
-          },
-        ],
-        toolConfig: {
-          functionCallingConfig: {
-            mode: FunctionCallingConfigMode.ANY,
-          },
+      toolConfig: {
+        functionCallingConfig: {
+          mode: FunctionCallingConfigMode.ANY,
         },
       },
-    });
+    };
+
+    const textOnlyParts: Part[] = [{ text: routerInstructions }];
+    const partAttempts = boardImagePart ? [parts, textOnlyParts] : [parts];
+
+    let response: Awaited<
+      ReturnType<GoogleGenAI["models"]["generateContent"]>
+    > | undefined;
+    let lastError: unknown;
+
+    for (const attemptParts of partAttempts) {
+      for (const model of GEMINI_TEXT_MODELS) {
+        try {
+          response = await ai.models.generateContent({
+            model,
+            contents: [
+              {
+                role: "user",
+                parts: attemptParts,
+              },
+            ],
+            config: generateConfig,
+          });
+          if (
+            model !== process.env.GEMINI_MODEL ||
+            attemptParts === textOnlyParts
+          ) {
+            console.info(
+              `Gemini recovered with ${model}${
+                attemptParts === textOnlyParts ? " (text only)" : ""
+              }`,
+            );
+          }
+          break;
+        } catch (error) {
+          lastError = error;
+          if (!isRetryableGeminiError(error)) throw error;
+          const status = Number((error as { status?: number })?.status);
+          console.warn(
+            `Gemini ${model} failed (${status || "retryable"}), trying next.`,
+          );
+          if (status !== 404) {
+            await sleep(350);
+          }
+        }
+      }
+      if (response) break;
+    }
+
+    if (!response) {
+      throw lastError instanceof Error
+        ? lastError
+        : new Error("Gemini is temporarily unavailable.");
+    }
 
     const functionCall = response.functionCalls?.[0];
 
@@ -1516,6 +1641,16 @@ ${prompt}
     });
   } catch (error) {
     console.error("Gemini tool router error:", error);
+
+    if (isGeminiUnavailable(error)) {
+      return NextResponse.json(
+        {
+          error:
+            "Gemini is busy right now. Press Send again — a fallback model will be tried.",
+        },
+        { status: 503 },
+      );
+    }
 
     const message =
       error instanceof Error

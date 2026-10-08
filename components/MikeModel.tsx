@@ -25,6 +25,22 @@ import { clone as skeletonClone } from "three/examples/jsm/utils/SkeletonUtils.j
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { DEFAULT_IDLE_ANIMATION_ID } from "@/lib/idleAnimation";
 import {
+  normalizeEmotion,
+  type MikeEmotion,
+} from "@/lib/facialExpressions";
+import { MikeFaceRig, type LipsyncSource } from "@/lib/mikeFaceRig";
+import {
+  MikePresenceRig,
+  type GazeMode,
+  type MikeReaction,
+} from "@/lib/mikePresence";
+import {
+  gestureScaleForShot,
+  pickRestPose,
+  REST_POSES,
+  type PerformanceShot,
+} from "@/lib/presentationGestures";
+import {
   animationClipCache,
   animationRegistry,
   createMikeAnimationFeature,
@@ -59,6 +75,14 @@ export interface MikeSpeakingOptions {
   forcePreferred?: boolean;
   /** Glance toward the whiteboard during this speech. */
   lookAtBoard?: boolean;
+  /** Speak with the hands at rest: no opener, only sparse beats. */
+  gestureless?: boolean;
+  /** Mixer weight multiplier for the opener (1 = baseline). */
+  gestureWeight?: number;
+  /** Camera framing: close-ups shrink the hands so they stay in-frame. */
+  shot?: PerformanceShot;
+  /** Teaching intent, used to pick a matching rest pose after the gesture. */
+  gestureIntent?: string | null;
 }
 
 export type MikeIdleMode = "rest" | "think" | "listen";
@@ -77,7 +101,30 @@ export interface MikeAnimationApi {
   setSpeaking(value: boolean, options?: MikeSpeakingOptions): void;
   setIdleMode(mode: MikeIdleMode): void;
   setLookAtBoard(enabled: boolean, strength?: number): void;
+  /** Where the head/eyes rest: camera (eye contact), board, or nowhere. */
+  setGaze(mode: GazeMode, strength?: number): void;
+  /** Brief look at the board, then back to the current gaze. */
+  glanceAtBoard(seconds?: number): void;
+  /** Attentive stance (head tilt, slow nods) while the user is talking. */
+  setListening(value: boolean): void;
+  /** Short physical reaction: laugh, hm, surprise, nod, shrug. */
+  playReaction(kind: MikeReaction): void;
+  /** Tell the performer how tight the camera is so gestures stay in-frame. */
+  setPerformanceShot(shot: PerformanceShot): void;
   setPaused(value: boolean): void;
+  /**
+   * Facial expression. Accepts a MikeEmotion or a loose alias
+   * ("smile", "stern", "shocked"); unknown values fall back to attentive.
+   */
+  setEmotion(emotion: string, options?: { intensity?: number }): MikeEmotion;
+  currentEmotion(): MikeEmotion;
+  /**
+   * Drive the mouth from speech. Pass the AnalyserNode the TTS audio flows
+   * through, "synthetic" for browser speechSynthesis, or null to stop.
+   */
+  setLipsync(source: LipsyncSource): void;
+  /** Face morph names found on the loaded mesh (dev/debug). */
+  faceMorphNames(): string[];
   stop(): void;
   registryRecord(animationId: string): AnimationRecord | null;
   subscribePlayback(listener: (event: PlaybackEvent) => void): () => void;
@@ -86,8 +133,8 @@ export interface MikeAnimationApi {
 interface MikeModelProps {
   onMeasured?: (bounds: MikeBounds) => void;
   onReady?: (api: MikeAnimationApi) => void;
+  /** World position Mike looks at when his gaze is on the board. */
   lookTarget?: [number, number, number] | null;
-  lookStrength?: number;
 }
 
 export const mikeAssets = createVersionedAssetResolver({
@@ -123,7 +170,33 @@ const SPEAKING_FILLER_IDS = [
 ] as const;
 
 const SPEECH_HOLD_SECONDS = 2.05;
+const SPEECH_OPENER_HOLD_SECONDS = 2.4;
 const SPEECH_FADE_SECONDS = 0.32;
+
+/**
+ * Gesture economy. Real presenters gesture on a fraction of what they say
+ * and rest their hands between beats. One opener at the start of a line,
+ * then a beat every SPEECH_BEAT_GAP seconds while there is enough speech
+ * left for the gesture to land.
+ */
+const SPEECH_BEAT_GAP: readonly [number, number] = [5.5, 9];
+const SPEECH_BEAT_MIN_REMAINING = 2.6;
+const SPEECH_BEAT_WEIGHT = 0.85;
+const SPEECH_MAX_FILLERS = 3;
+
+/**
+ * Gesture ↔ speech timing. The opener waits for the first loud syllable
+ * (or this ceiling) so the hand peaks on a word, not on silence.
+ */
+const SPEECH_ONSET_LOW = 0.16;
+const SPEECH_ONSET_HIGH = 0.34;
+const SPEECH_OPENER_MIN_WAIT = 0.05;
+const SPEECH_OPENER_MAX_WAIT = 0.38;
+const SPEECH_BEAT_ONSET_SLACK = 0.55;
+const SPEECH_BEAT_PAUSE_SLACK = 0.9;
+
+const IDLE_FIDGET_GAP: readonly [number, number] = [26, 42];
+const IDLE_FIDGET_HOLD: readonly [number, number] = [5.5, 8];
 
 function shuffleIds(ids: string[]): string[] {
   const next = [...ids];
@@ -149,35 +222,58 @@ function capClipDuration(
   return clip.duration;
 }
 
-function buildSpeechCandidateIds(preferred: string): string[] {
-  const pool = shuffleIds(
-    SPEAKING_FILLER_IDS.filter((id) => id !== preferred),
-  );
-  return [preferred, ...pool];
-}
-
-const WORLD_UP = new THREE.Vector3(0, 1, 0);
-const LOOK_HEAD_POS = new THREE.Vector3();
-const LOOK_OFFSET = new THREE.Vector3();
-const LOOK_HEAD_NAMES = ["CC_Base_Head"];
-const LOOK_NECK_NAMES = ["CC_Base_NeckTwist01", "CC_Base_NeckTwist02"];
-const LOOK_EYE_NAMES = ["CC_Base_L_Eye", "CC_Base_R_Eye"];
+type PreparedSpeechItem = {
+  name: string;
+  animationId: string;
+  repeats: number;
+  fade: number;
+  transitionLeadSeconds: number;
+};
 
 type PreparedSpeech = {
   key: string;
-  items: Array<{
-    name: string;
-    animationId: string;
-    repeats: number;
-    fade: number;
-    transitionLeadSeconds: number;
-  }>;
+  /** Gesture that lands with the first words; null for gestureless lines. */
+  opener: PreparedSpeechItem | null;
+  openerWeight: number;
+  /** Sparse beats to sprinkle through longer lines. */
+  fillers: PreparedSpeechItem[];
+  durationSeconds: number;
+};
+
+type SpeechBeatState = {
+  elapsed: number;
+  nextBeatAt: number;
+  fillerIndex: number;
+  durationSeconds: number;
+  fillers: PreparedSpeechItem[];
+  opener: PreparedSpeechItem | null;
+  openerWeight: number;
+        openerPlayed: boolean;
+  lastMouth: number;
+};
+
+type IdleFidgetState = {
+  elapsed: number;
+  nextAt: number;
+  holdUntil: number;
+  active: boolean;
 };
 
 const MODEL_POSITION: [number, number, number] = [-3.1, 0, 1.0];
 const MODEL_ROTATION: [number, number, number] = [0, 0.25, 0];
 const STUDIO_FLOOR_Y = 0.02;
 const FOOT_BOX = new THREE.Box3();
+const MAX_FRAME_DELTA = 1 / 24;
+
+function plantOnFloor(root: THREE.Object3D) {
+  root.updateMatrixWorld(true);
+  FOOT_BOX.setFromObject(root);
+  if (!Number.isFinite(FOOT_BOX.min.y)) return;
+  const lift = STUDIO_FLOOR_Y - FOOT_BOX.min.y;
+  if (Math.abs(lift) > 0.0005) {
+    root.position.y += lift;
+  }
+}
 
 // Mike's height in scene units. The board layout adapts to the measured
 // bounds, so this only controls his size relative to the studio/camera.
@@ -487,7 +583,6 @@ export default function MikeModel({
   onMeasured,
   onReady,
   lookTarget = null,
-  lookStrength = 0.2,
 }: MikeModelProps) {
   const [model, setModel] = useState<THREE.Object3D | null>(null);
   const groupRef = useRef<THREE.Group>(null);
@@ -509,16 +604,23 @@ export default function MikeModel({
   const upperBodyPlayToken = useRef(0);
   const onMeasuredRef = useRef(onMeasured);
   const onReadyRef = useRef(onReady);
-  const lookTargetRef = useRef<[number, number, number] | null>(lookTarget);
-  const lookStrengthRef = useRef(lookStrength);
-  const lookYawRef = useRef(0);
-  const lookPitchRef = useRef(0);
-  const lookBonesRef = useRef<{
-    head: THREE.Bone[];
-    neck: THREE.Bone[];
-    eyes: THREE.Bone[];
-  }>({ head: [], neck: [], eyes: [] });
   const idleModeRef = useRef<MikeIdleMode>("rest");
+  const faceRef = useRef<MikeFaceRig | null>(null);
+  const presenceRef = useRef<MikePresenceRig | null>(null);
+  const speechBeatRef = useRef<SpeechBeatState | null>(null);
+  const performanceShotRef = useRef<PerformanceShot>("waist");
+  const lastRestIdRef = useRef<string | null>(null);
+  const lastGestureIntentRef = useRef<string | null>(null);
+  const idleFidgetRef = useRef<IdleFidgetState>({
+    elapsed: 0,
+    nextAt: IDLE_FIDGET_GAP[0] + Math.random() * (IDLE_FIDGET_GAP[1] - IDLE_FIDGET_GAP[0]),
+    holdUntil: 0,
+    active: false,
+  });
+  const playGestureThenRestRef = useRef<
+    (item: PreparedSpeechItem, weight: number) => void
+  >(() => {});
+  const enterRestPoseRef = useRef<(intent?: string | null) => void>(() => {});
 
   useEffect(() => {
     onMeasuredRef.current = onMeasured;
@@ -529,12 +631,8 @@ export default function MikeModel({
   }, [onReady]);
 
   useEffect(() => {
-    lookTargetRef.current = lookTarget ?? null;
+    if (lookTarget) presenceRef.current?.setBoardTarget(lookTarget);
   }, [lookTarget]);
-
-  useEffect(() => {
-    lookStrengthRef.current = lookStrength;
-  }, [lookStrength]);
 
   useEffect(() => {
     let cancelled = false;
@@ -542,20 +640,18 @@ export default function MikeModel({
       .then((scene) => {
         if (cancelled) return;
         const fitted = fitMike(scene);
+        fitted.visible = false;
         modelRef.current = fitted;
         basePositionRef.current = fitted.position.clone();
-        const bones = getDrivingBones(fitted);
-        lookBonesRef.current = {
-          head: LOOK_HEAD_NAMES.map((name) => bones.get(name)).filter(
-            (bone): bone is THREE.Bone => Boolean(bone),
-          ),
-          neck: LOOK_NECK_NAMES.map((name) => bones.get(name)).filter(
-            (bone): bone is THREE.Bone => Boolean(bone),
-          ),
-          eyes: LOOK_EYE_NAMES.map((name) => bones.get(name)).filter(
-            (bone): bone is THREE.Bone => Boolean(bone),
-          ),
-        };
+        const face = new MikeFaceRig(fitted);
+        if (face.morphCount === 0) {
+          console.warn("Mike face morphs not found; emotions disabled.");
+        }
+        face.setEmotion("attentive");
+        faceRef.current = face;
+        const presence = new MikePresenceRig(getDrivingBones(fitted), fitted);
+        if (lookTarget) presence.setBoardTarget(lookTarget);
+        presenceRef.current = presence;
         setModel(fitted);
       })
       .catch((error) => {
@@ -745,6 +841,17 @@ export default function MikeModel({
       layer: "upper_body",
       fallbackActionName: null,
       fadeOutWhenEmpty: true,
+      onActionStart: (item: { name: string }) => {
+        if (!item.name.startsWith("rest-")) return;
+        const pose = REST_POSES.find((entry) => entry.name === item.name);
+        const action = upperBodyActions.current[item.name];
+        if (!pose || !action) return;
+        const shotScale = gestureScaleForShot(performanceShotRef.current);
+        action.weight = Math.max(
+          0.26,
+          pose.weight * Math.min(1, 0.55 + shotScale * 0.45),
+        );
+      },
       onActionRetired: ({ name, action }: {
         name: string;
         action: THREE.AnimationAction;
@@ -752,7 +859,7 @@ export default function MikeModel({
         // The entire speech sequence is prepared before audio starts. Queue
         // crossfades temporarily retire future actions, so retain them until
         // the speech segment completes and cleanup runs.
-        if (name.startsWith("speech-")) return;
+        if (name.startsWith("speech-") || name.startsWith("rest-")) return;
         if (upperBodyActions.current[name] !== action) return;
         action.stop();
         mixer.current?.uncacheAction(action.getClip(), modelRef.current ?? undefined);
@@ -760,13 +867,91 @@ export default function MikeModel({
       },
     });
     // eslint-disable-next-line react-hooks/immutability
-    model.visible = true;
+    model.visible = false;
 
     const speechKey = (options: MikeSpeakingOptions = {}) => {
       const preferred = options.preferredAnimationId ?? "seg_377";
       const duration = Math.max(1, options.estimatedDurationSec ?? 3);
-      return `${preferred}:${duration.toFixed(3)}`;
+      const rest = options.gestureless ? "rest" : "gesture";
+      const weight = (options.gestureWeight ?? 1).toFixed(2);
+      return `${preferred}:${duration.toFixed(3)}:${rest}:${weight}`;
     };
+
+    /** Apply a per-gesture weight after the queue has started the action. */
+    const applyGestureWeight = (name: string, weight: number) => {
+      const action = upperBodyActions.current[name];
+      if (action) action.weight = Math.max(0.05, weight);
+    };
+
+    const startSpeechBeats = (
+      prepared: PreparedSpeech,
+      skipOpener: boolean,
+    ) => {
+      const firstGap =
+        prepared.opener && !skipOpener
+          ? SPEECH_BEAT_GAP[0] + Math.random() * (SPEECH_BEAT_GAP[1] - SPEECH_BEAT_GAP[0])
+          : SPEECH_BEAT_GAP[1] * 0.8 + Math.random() * 2;
+      speechBeatRef.current = {
+        elapsed: 0,
+        nextBeatAt: firstGap,
+        fillerIndex: 0,
+        durationSeconds: prepared.durationSeconds,
+        fillers: prepared.fillers,
+        opener: skipOpener ? null : prepared.opener,
+        openerWeight: prepared.openerWeight,
+        openerPlayed: skipOpener || !prepared.opener,
+        lastMouth: 0,
+      };
+    };
+
+    const enterRestPose = (intent?: string | null) => {
+      const pose = pickRestPose(lastRestIdRef.current, intent);
+      const action = upperBodyActions.current[pose.name];
+      if (!action || !upperBodyQueueRef.current) return;
+      lastRestIdRef.current = pose.id;
+      const shotScale = gestureScaleForShot(performanceShotRef.current);
+      upperBodyQueueRef.current.playNow([
+        {
+          name: pose.name,
+          animationId: pose.id,
+          loop: true,
+          repeats: Infinity,
+          fade: 0.48,
+        },
+      ]);
+      action.weight = Math.max(0.26, pose.weight * Math.min(1, 0.55 + shotScale * 0.45));
+    };
+
+    const playGestureThenRest = (item: PreparedSpeechItem, weight: number) => {
+      const pose = pickRestPose(lastRestIdRef.current, lastGestureIntentRef.current);
+      lastRestIdRef.current = pose.id;
+      const restReady = Boolean(upperBodyActions.current[pose.name]);
+      upperBodyQueueRef.current?.playNow(
+        restReady
+          ? [
+              item,
+              {
+                name: pose.name,
+                animationId: pose.id,
+                loop: true,
+                repeats: Infinity,
+                fade: 0.42,
+              },
+            ]
+          : [item],
+      );
+      applyGestureWeight(item.name, weight);
+      const restAction = upperBodyActions.current[pose.name];
+      if (restAction) {
+        const shotScale = gestureScaleForShot(performanceShotRef.current);
+        restAction.weight = Math.max(
+          0.26,
+          pose.weight * Math.min(1, 0.55 + shotScale * 0.45),
+        );
+      }
+    };
+    playGestureThenRestRef.current = playGestureThenRest;
+    enterRestPoseRef.current = enterRestPose;
 
     function cleanupPreparedSpeechActions(options: {
       preparationToken?: number;
@@ -804,7 +989,7 @@ export default function MikeModel({
       const key = speechKey(options);
 
       if (preparedSpeechRef.current?.key === key) {
-        return preparedSpeechRef.current.items.length > 0;
+        return true;
       }
 
       const preparationToken = ++speechPreparationTokenRef.current;
@@ -816,39 +1001,38 @@ export default function MikeModel({
           ? requestedPreferred
           : "seg_377";
       const targetSeconds = Math.max(1, options.estimatedDurationSec ?? 3);
-      const candidates = buildSpeechCandidateIds(preferred);
+      const gestureless = options.gestureless === true;
       cleanupPreparedSpeechActions();
-      const items: PreparedSpeech["items"] = [];
-      let coveredSeconds = 0;
-      let candidateIndex = 0;
-      let attempts = 0;
-      const failedIds = new Set<string>();
 
-      while (
-        coveredSeconds < targetSeconds + 0.35 &&
-        items.length < 12 &&
-        failedIds.size < candidates.length &&
-        attempts < candidates.length * 3
-      ) {
-        attempts += 1;
-        const animationId = candidates[candidateIndex % candidates.length];
-        candidateIndex += 1;
+      // How many sparse beats could this line hold? Cap the preloads.
+      const beatBudget = Math.max(
+        0,
+        Math.min(
+          SPEECH_MAX_FILLERS,
+          Math.floor((targetSeconds - SPEECH_BEAT_MIN_REMAINING) / SPEECH_BEAT_GAP[0]),
+        ),
+      );
+      const fillerPool = shuffleIds(
+        SPEAKING_FILLER_IDS.filter(
+          (id) => id !== preferred && id !== lastSpeechOpenerIdRef.current,
+        ),
+      );
+      const wanted: Array<{ animationId: string; role: "opener" | "filler" }> = [];
+      if (!gestureless) wanted.push({ animationId: preferred, role: "opener" });
+      for (const id of fillerPool.slice(0, beatBudget)) {
+        wanted.push({ animationId: id, role: "filler" });
+      }
 
-        if (failedIds.has(animationId)) {
-          continue;
-        }
-        if (items.at(-1)?.animationId === animationId) {
-          continue;
-        }
+      let opener: PreparedSpeechItem | null = null;
+      const fillers: PreparedSpeechItem[] = [];
 
-        const record = animationRegistry.resolve(animationId);
+      for (const [index, entry] of wanted.entries()) {
+        const record = animationRegistry.resolve(entry.animationId);
         if (!record) {
-          console.warn(`Missing Mixamo teaching animation: ${animationId}`);
-          failedIds.add(animationId);
+          console.warn(`Missing teaching animation: ${entry.animationId}`);
           continue;
         }
-
-        const name = `speech-${preparationToken}-${items.length}-${animationId}`;
+        const name = `speech-${preparationToken}-${index}-${entry.animationId}`;
         let action: THREE.AnimationAction | null = null;
         try {
           action = await prepareClip(
@@ -857,8 +1041,7 @@ export default function MikeModel({
             "upper_body",
           );
         } catch (error) {
-          console.warn(`Skipping failed speech animation ${animationId}:`, error);
-          failedIds.add(animationId);
+          console.warn(`Skipping failed speech animation ${entry.animationId}:`, error);
           continue;
         }
 
@@ -868,15 +1051,11 @@ export default function MikeModel({
         ) {
           return false;
         }
-
-        if (!action) {
-          failedIds.add(animationId);
-          continue;
-        }
+        if (!action) continue;
 
         const holdDuration = capClipDuration(
           action.getClip(),
-          SPEECH_HOLD_SECONDS,
+          entry.role === "opener" ? SPEECH_OPENER_HOLD_SECONDS : SPEECH_HOLD_SECONDS,
         );
         if (!Number.isFinite(holdDuration) || holdDuration <= 0) {
           action.stop();
@@ -887,33 +1066,38 @@ export default function MikeModel({
             modelRef.current ?? undefined,
           );
           delete upperBodyActions.current[name];
-          failedIds.add(animationId);
           continue;
         }
-        items.push({
+        const item: PreparedSpeechItem = {
           name,
-          animationId,
+          animationId: entry.animationId,
           repeats: 1,
           fade: SPEECH_FADE_SECONDS,
           transitionLeadSeconds: SPEECH_FADE_SECONDS,
-        });
-        coveredSeconds += Math.max(0.7, holdDuration - SPEECH_FADE_SECONDS);
+        };
+        if (entry.role === "opener") opener = item;
+        else fillers.push(item);
       }
 
-      if (items[0]?.animationId) {
-        lastSpeechOpenerIdRef.current = items[0].animationId;
-      }
-      preparedSpeechRef.current = { key, items };
-      return items.length > 0;
+      if (opener) lastSpeechOpenerIdRef.current = opener.animationId;
+      preparedSpeechRef.current = {
+        key,
+        opener,
+        openerWeight: options.gestureWeight ?? 1,
+        fillers,
+        durationSeconds: targetSeconds,
+      };
+      return opener !== null || fillers.length > 0 || gestureless;
     }
 
     async function playUpperBodyClip(
       animationId: string,
-      options: { loop?: boolean; fade?: number } = {},
+      options: { loop?: boolean; fade?: number; weight?: number } = {},
     ): Promise<boolean> {
       const record = animationRegistry.resolve(animationId);
       if (!record || !mixer.current || !upperBodyQueueRef.current) return false;
-      const name = `cue-${animationId}-${++upperBodyPlayToken.current}`;
+      const token = ++upperBodyPlayToken.current;
+      const name = `cue-${animationId}-${token}`;
       try {
         const action = await prepareClip(
           mikeAssets.resolveAnimation(record),
@@ -921,6 +1105,10 @@ export default function MikeModel({
           "upper_body",
         );
         if (!action || !upperBodyQueueRef.current) return false;
+        // Something newer (speech, another cue) took over while loading.
+        if (token !== upperBodyPlayToken.current || speakingRef.current) {
+          return false;
+        }
         upperBodyQueueRef.current.playNow([
           {
             name,
@@ -931,6 +1119,9 @@ export default function MikeModel({
             transitionLeadSeconds: 0.28,
           },
         ]);
+        if (typeof options.weight === "number") {
+          action.weight = Math.max(0.05, options.weight);
+        }
         return true;
       } catch (error) {
         console.warn(`Upper-body cue ${animationId} failed:`, error);
@@ -942,6 +1133,8 @@ export default function MikeModel({
       const retiringPreparationToken = speechPreparationTokenRef.current;
       const retiringAction = upperBodyCurrentAction.current;
       speakingRef.current = false;
+      speechBeatRef.current = null;
+      presenceRef.current?.setSpeaking(false);
       speechPreparationTokenRef.current += 1;
       playToken.current += 1;
       upperBodyPlayToken.current += 1;
@@ -998,6 +1191,12 @@ export default function MikeModel({
         },
         playWaiting: () => {
           idleModeRef.current = "rest";
+          idleFidgetRef.current = {
+            elapsed: 0,
+            nextAt: IDLE_FIDGET_GAP[0] + Math.random() * (IDLE_FIDGET_GAP[1] - IDLE_FIDGET_GAP[0]),
+            holdUntil: 0,
+            active: false,
+          };
           if (speakingRef.current) {
             stopSpeakingMotion();
           } else {
@@ -1012,9 +1211,6 @@ export default function MikeModel({
         setSpeaking: (value, options = {}) => {
           const next = Boolean(value);
           feature?.setSpeaking(next);
-          if (options.lookAtBoard) {
-            lookStrengthRef.current = Math.max(lookStrengthRef.current, 0.38);
-          }
           if (!next) {
             if (speakingRef.current) stopSpeakingMotion();
             idleModeRef.current = "rest";
@@ -1023,6 +1219,13 @@ export default function MikeModel({
 
           idleModeRef.current = "rest";
           speakingRef.current = true;
+          idleFidgetRef.current = {
+            elapsed: 0,
+            nextAt: IDLE_FIDGET_GAP[0] + Math.random() * (IDLE_FIDGET_GAP[1] - IDLE_FIDGET_GAP[0]),
+            holdUntil: 0,
+            active: false,
+          };
+          presenceRef.current?.setSpeaking(true);
 
           const startPrepared = () => {
             if (!speakingRef.current) {
@@ -1035,7 +1238,20 @@ export default function MikeModel({
               return;
             }
 
-            upperBodyQueueRef.current?.playNow(prepared.items);
+            const shot = options.shot ?? performanceShotRef.current;
+            if (options.shot) performanceShotRef.current = options.shot;
+            presenceRef.current?.setShotScale(gestureScaleForShot(shot));
+            lastGestureIntentRef.current = options.gestureless
+              ? "none"
+              : (options.gestureIntent ?? null);
+
+            // Face close-up: keep the hands at rest and let the face work.
+            // Otherwise hold the opener until the first loud syllable.
+            const skipOpener = !prepared.opener || shot === "face";
+            startSpeechBeats(prepared, skipOpener);
+            if (skipOpener) {
+              enterRestPoseRef.current("none");
+            }
           };
 
           if (preparedSpeechRef.current?.key === speechKey(options)) {
@@ -1052,26 +1268,53 @@ export default function MikeModel({
         setIdleMode: (mode) => {
           idleModeRef.current = mode;
           if (speakingRef.current) return;
+          // Soft loops: blended under the idle arms so they read as a stance,
+          // not a repeated gesture.
           if (mode === "think") {
-            void playUpperBodyClip("seg_312", { loop: true, fade: 0.4 });
+            void playUpperBodyClip("seg_312", { loop: true, fade: 0.6, weight: 0.55 });
             return;
           }
           if (mode === "listen") {
-            void playUpperBodyClip("seg_427", { loop: true, fade: 0.4 });
+            void playUpperBodyClip("seg_427", { loop: true, fade: 0.6, weight: 0.5 });
             return;
           }
+          upperBodyPlayToken.current += 1;
           upperBodyQueueRef.current?.clear({
             emitInterrupted: true,
             reason: "idle",
           });
         },
         setLookAtBoard: (enabled, strength) => {
-          if (!enabled) {
-            lookStrengthRef.current = 0;
-            return;
-          }
-          lookStrengthRef.current = strength ?? 0.36;
+          presenceRef.current?.setGaze(enabled ? "board" : "camera", strength);
         },
+        setGaze: (mode, strength) => {
+          presenceRef.current?.setGaze(mode, strength);
+        },
+        glanceAtBoard: (seconds) => {
+          presenceRef.current?.glanceAtBoard(seconds);
+        },
+        setListening: (value) => {
+          presenceRef.current?.setListening(Boolean(value));
+        },
+        playReaction: (kind) => {
+          presenceRef.current?.playReaction(kind);
+        },
+        setPerformanceShot: (shot) => {
+          performanceShotRef.current = shot;
+          presenceRef.current?.setShotScale(gestureScaleForShot(shot));
+        },
+        setEmotion: (emotion, options = {}) => {
+          const resolved = normalizeEmotion(emotion) ?? "attentive";
+          faceRef.current?.setEmotion(resolved, options.intensity ?? 1);
+          presenceRef.current?.setEmotion(resolved);
+          return resolved;
+        },
+        currentEmotion: () =>
+          faceRef.current?.currentEmotion() ?? "attentive",
+        setLipsync: (source) => {
+          faceRef.current?.setLipsync(source);
+        },
+        faceMorphNames: () => faceRef.current?.morphNames() ?? [],
         stop: () => {
           stopSpeakingMotion();
           feature?.stop();
@@ -1099,16 +1342,35 @@ export default function MikeModel({
               name: "waiting",
               animationId: DEFAULT_IDLE_ANIMATION_ID,
               loop: true,
-              fade: 0.2,
+              fade: 0,
             },
           ]);
+          mixer.current.update(0);
+          if (groupRef.current) plantOnFloor(groupRef.current);
         }
+
+        model.visible = true;
 
         const api = buildApi();
         if (process.env.NODE_ENV !== "production") {
           (window as unknown as Record<string, unknown>).__lixiaMike = api;
         }
         onReadyRef.current?.(api);
+
+        for (const pose of REST_POSES) {
+          const record = animationRegistry.resolve(pose.id);
+          if (!record) continue;
+          try {
+            await prepareClip(
+              mikeAssets.resolveAnimation(record),
+              pose.name,
+              "upper_body",
+            );
+          } catch (error) {
+            console.warn(`Rest pose ${pose.id} failed to load:`, error);
+          }
+          if (cancelled) return;
+        }
 
         void animationClipCache.preload(
           SPEAKING_FILLER_IDS.flatMap((id) => {
@@ -1146,43 +1408,115 @@ export default function MikeModel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model]);
 
-  useFrame((_, delta) => {
-    mixer.current?.update(delta);
-    queueRef.current?.update(delta);
-    upperBodyQueueRef.current?.update(delta);
-    featureRef.current?.update(delta);
+  const timerRef = useRef<THREE.Timer | null>(null);
 
-    if (groupRef.current) {
-      groupRef.current.updateMatrixWorld(true);
-      FOOT_BOX.setFromObject(groupRef.current);
-      if (Number.isFinite(FOOT_BOX.min.y)) {
-        const lift = STUDIO_FLOOR_Y - FOOT_BOX.min.y;
-        if (Math.abs(lift) > 0.0005) {
-          groupRef.current.position.y += lift;
-        }
-      }
+  useEffect(() => {
+    return () => {
+      timerRef.current?.dispose();
+      timerRef.current = null;
+    };
+  }, []);
+
+  useFrame((state) => {
+    if (!timerRef.current) {
+      timerRef.current = new THREE.Timer();
     }
 
-    const target = lookTargetRef.current;
-    const strength = lookStrengthRef.current;
-    const head = lookBonesRef.current.head[0];
-    if (head && target && strength > 0.12) {
-      head.getWorldPosition(LOOK_HEAD_POS);
-      LOOK_OFFSET.set(target[0], target[1], target[2]).sub(LOOK_HEAD_POS);
-      const desiredYaw = Math.atan2(LOOK_OFFSET.x, LOOK_OFFSET.z);
-      const yaw = THREE.MathUtils.clamp(desiredYaw * strength, -0.45, 0.45);
-      lookYawRef.current = THREE.MathUtils.damp(lookYawRef.current, yaw, 5, delta);
-      lookPitchRef.current = THREE.MathUtils.damp(lookPitchRef.current, 0, 6, delta);
-      head.rotateOnWorldAxis(WORLD_UP, lookYawRef.current);
-      for (const neck of lookBonesRef.current.neck) {
-        neck.rotateOnWorldAxis(WORLD_UP, lookYawRef.current * 0.28);
+    timerRef.current.update();
+    const delta = Math.min(timerRef.current.getDelta(), MAX_FRAME_DELTA);
+    const paused = (mixer.current?.timeScale ?? 1) === 0;
+
+    // Face first so gesture timing sees this frame's mouth, not last frame's.
+    faceRef.current?.update(delta);
+
+    if (!paused) {
+      mixer.current?.update(delta);
+      queueRef.current?.update(delta);
+      upperBodyQueueRef.current?.update(delta);
+      featureRef.current?.update(delta);
+
+      // Sparse gesture beats while speaking, timed to the lipsync envelope.
+      const beats = speechBeatRef.current;
+      if (beats && speakingRef.current) {
+        beats.elapsed += delta;
+        const mouth = faceRef.current?.currentMouthLevel() ?? 0;
+        const rising =
+          beats.lastMouth < SPEECH_ONSET_LOW && mouth >= SPEECH_ONSET_HIGH;
+        beats.lastMouth = mouth;
+        const shot = performanceShotRef.current;
+        const shotScale = gestureScaleForShot(shot);
+        const remaining = beats.durationSeconds - beats.elapsed;
+
+        if (!beats.openerPlayed && beats.opener) {
+          const waitedLongEnough = beats.elapsed >= SPEECH_OPENER_MIN_WAIT;
+          const hitOnset = waitedLongEnough && rising;
+          const hitCeiling = beats.elapsed >= SPEECH_OPENER_MAX_WAIT;
+          if (hitOnset || hitCeiling) {
+            playGestureThenRestRef.current(
+              beats.opener,
+              beats.openerWeight * shotScale,
+            );
+            beats.openerPlayed = true;
+          }
+        }
+
+        const allowBeats = shot !== "face";
+        if (
+          allowBeats &&
+          beats.openerPlayed &&
+          beats.elapsed >= beats.nextBeatAt &&
+          remaining >= SPEECH_BEAT_MIN_REMAINING &&
+          beats.fillerIndex < beats.fillers.length &&
+          beats.fillerIndex < (shot === "close" ? 1 : SPEECH_MAX_FILLERS)
+        ) {
+          const waited = beats.elapsed - beats.nextBeatAt;
+          const inPause = mouth < 0.1;
+          const slack = inPause ? SPEECH_BEAT_PAUSE_SLACK : SPEECH_BEAT_ONSET_SLACK;
+          if (rising || waited >= slack) {
+            const item = beats.fillers[beats.fillerIndex];
+            beats.fillerIndex += 1;
+            playGestureThenRestRef.current(item, SPEECH_BEAT_WEIGHT * shotScale);
+            beats.nextBeatAt =
+              beats.elapsed +
+              SPEECH_BEAT_GAP[0] +
+              Math.random() * (SPEECH_BEAT_GAP[1] - SPEECH_BEAT_GAP[0]);
+          }
+        }
+      } else if (!speakingRef.current && idleModeRef.current === "rest") {
+        const fidget = idleFidgetRef.current;
+        fidget.elapsed += delta;
+        if (fidget.active && fidget.elapsed >= fidget.holdUntil) {
+          upperBodyQueueRef.current?.clear({
+            emitInterrupted: true,
+            reason: "idle",
+          });
+          fidget.active = false;
+          fidget.nextAt =
+            fidget.elapsed +
+            IDLE_FIDGET_GAP[0] +
+            Math.random() * (IDLE_FIDGET_GAP[1] - IDLE_FIDGET_GAP[0]);
+        } else if (!fidget.active && fidget.elapsed >= fidget.nextAt) {
+          enterRestPoseRef.current(lastGestureIntentRef.current);
+          fidget.active = true;
+          fidget.holdUntil =
+            fidget.elapsed +
+            IDLE_FIDGET_HOLD[0] +
+            Math.random() * (IDLE_FIDGET_HOLD[1] - IDLE_FIDGET_HOLD[0]);
+        }
       }
-      for (const eye of lookBonesRef.current.eyes) {
-        eye.rotateOnWorldAxis(WORLD_UP, lookYawRef.current * 0.12);
+
+      if (groupRef.current && model?.visible) {
+        plantOnFloor(groupRef.current);
       }
-    } else {
-      lookYawRef.current = THREE.MathUtils.damp(lookYawRef.current, 0, 6, delta);
-      lookPitchRef.current = THREE.MathUtils.damp(lookPitchRef.current, 0, 6, delta);
+
+      // Presence layer: gaze, saccades, breathing, sway, nods. Runs after
+      // the mixer has written bone poses and only while the mixer is
+      // advancing, so offsets never accumulate on a frozen pose.
+      if (presenceRef.current && groupRef.current) {
+        const face = faceRef.current;
+        if (face) presenceRef.current.noteSpeechLevel(face.currentMouthLevel());
+        presenceRef.current.update(delta, state.camera, groupRef.current);
+      }
     }
   });
 
