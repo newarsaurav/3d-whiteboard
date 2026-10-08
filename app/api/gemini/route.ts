@@ -59,6 +59,16 @@ interface WeatherResponse {
 const MAX_PROMPT_LENGTH = 3000;
 const MAX_CONTEXT_LENGTH = 18000;
 
+const ADDITIVE_IMAGE_WORDS =
+  /\b(add|place|put|include|beside|next to|alongside|append)\b/i;
+
+function isAdditiveImageRequest(
+  prompt: string,
+  hasBoardImage: boolean,
+): boolean {
+  return hasBoardImage && ADDITIVE_IMAGE_WORDS.test(prompt);
+}
+
 const GEMINI_TEXT_MODELS = uniqueModels([
   "gemini-3.1-flash-lite",
   process.env.GEMINI_MODEL,
@@ -1124,7 +1134,7 @@ async function buildImageCommand(
         "Keep the drawing simple and readable: avoid tiny details, clutter, dense hatching, or broken fragmented lines.",
         "Do not use gradients, shadows, photographic texture, or large filled areas.",
         "Keep the background plain pure white with no floor, sky, scenery, setting, or other decoration.",
-        "Do not add text, labels, borders, watermarks, or a poster-like layout.",
+        "Do not add text, labels, borders, watermarks, captions, logos, signatures, board names, or poster-like layouts.",
         "The final result should look like a teacher quickly sketched it with a black dry-erase marker.",
       ].join("\n");
 
@@ -1144,8 +1154,8 @@ Rules:
 - If adding an object, place it naturally without covering important existing content.
 - ${prefersRealistic ? "Preserve the existing background treatment." : "Use an opaque pure-white background; do not leave transparent areas."}
 - If the current board already looks hand-drawn, continue in the same whiteboard-doodle style unless the user explicitly asks for realistic style.
-- Do not add new text, labels, borders, watermarks, or captions unless explicitly requested.
-- Return only the edited image as PNG.
+- Do not add new text, labels, borders, watermarks, captions, logos, signatures, or board names unless the user explicitly requests that exact content.
+- Return only the edited image as PNG. The result may contain only the requested addition and its minimal supporting visual details.
       `.trim()
       : `
 Create an image for display on a 16:9 interactive teaching whiteboard.
@@ -1158,10 +1168,10 @@ ${styleInstructions}
 Rules:
 - Compose the subject clearly with comfortable margins so it looks good on a whiteboard.
 - Keep the subject large enough and visually simple enough to remain recognizable after whiteboard rendering.
-- Avoid unnecessary text, labels, frames, watermarks, or captions.
+- Avoid unnecessary text, labels, frames, watermarks, captions, logos, signatures, or board names.
 - ${prefersRealistic ? "Follow the requested scene and background, avoiding unrelated decoration." : "Draw only the requested subject on a plain pure-white background. Do not add scenery, ground, sky, shadows, props, or decorative background elements."}
 - ${prefersRealistic ? "Use a background or setting when the user's request names one." : "Include a background or setting only when the user's request explicitly names one, and then show only the requested subject with that setting."}
-- Return only the generated image as PNG.
+- Return only the generated image as PNG. Do not reproduce the board's title, brand, signature, or watermark.
       `.trim();
 
   const imageParts: Part[] = [{ text: imageInstructions }];
@@ -1527,21 +1537,21 @@ ${prompt}
         ? (functionCall.args as Record<string, unknown>)
         : {};
 
-    const isAdditiveImageRequest =
-      Boolean(boardImagePart) &&
-      /\b(add|place|put|include|beside|next to|alongside)\b/i.test(prompt);
+    const additiveRequest = isAdditiveImageRequest(
+      prompt,
+      Boolean(boardImagePart),
+    );
 
     const shouldEditExistingImage =
       functionCall.name === "edit_board_image" ||
-      (functionCall.name === "generate_image" && isAdditiveImageRequest);
+      additiveRequest;
 
-    const imageEditArgs =
-      functionCall.name === "generate_image" && isAdditiveImageRequest
-        ? {
-            ...args,
-            instruction: readString(args.prompt, prompt, 1200),
-          }
-        : args;
+    const imageEditArgs = additiveRequest
+      ? {
+          ...args,
+          instruction: readString(args.prompt, prompt, 1200),
+        }
+      : args;
 
     let command: BoardCommand | TeacherLessonCommand | BoardManagementCommand;
 
