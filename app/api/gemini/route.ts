@@ -1016,6 +1016,9 @@ async function buildImageCommand(
   const prefersRealistic =
     requestNeedsRealisticImage(requestedText) ||
     (mode === "edit" && currentStyle === "realistic");
+  const isAdditiveEdit =
+    mode === "edit" &&
+    /\b(add|place|put|include|beside|next to|alongside)\b/i.test(requestedText);
 
   if (mode === "edit" && !boardImagePart) {
     throw new Error(
@@ -1030,13 +1033,14 @@ async function buildImageCommand(
       ].join("\n")
     : [
         "Style: simple classroom whiteboard marker drawing.",
-        "Use bold clean dark marker outlines with a transparent background, like an isolated PNG sticker.",
+        "Use bold clean dark marker outlines on a solid pure-white (#FFFFFF) background.",
+        "Return the image as PNG; do not use transparency.",
         "Prioritize a clear recognizable silhouette first, then add only a few important interior details.",
         "Make cartoon characters and animals easy to recognize from a distance.",
         "Use loose hand-drawn contours with occasional retraced lines, small overshoots, and slight wobble.",
         "Keep the drawing simple and readable: avoid tiny details, clutter, dense hatching, or broken fragmented lines.",
         "Do not use gradients, shadows, photographic texture, or large filled areas.",
-        "Never draw a background, floor, sky, scenery, setting, or white rectangle.",
+        "Keep the background plain pure white with no floor, sky, scenery, setting, or other decoration.",
         "Do not add text, labels, borders, watermarks, or a poster-like layout.",
         "The final result should look like a teacher quickly sketched it with a black dry-erase marker.",
       ].join("\n");
@@ -1055,10 +1059,10 @@ Rules:
 - Keep the same overall 16:9 whiteboard composition.
 - Do not replace, restyle, or distort unrelated content.
 - If adding an object, place it naturally without covering important existing content.
-- Keep all empty areas transparent; do not add a background or white rectangle.
+- ${prefersRealistic ? "Preserve the existing background treatment." : "Use an opaque pure-white background; do not leave transparent areas."}
 - If the current board already looks hand-drawn, continue in the same whiteboard-doodle style unless the user explicitly asks for realistic style.
 - Do not add new text, labels, borders, watermarks, or captions unless explicitly requested.
-- Return only the edited image.
+- Return only the edited image as PNG.
       `.trim()
       : `
 Create an image for display on a 16:9 interactive teaching whiteboard.
@@ -1072,9 +1076,9 @@ Rules:
 - Compose the subject clearly with comfortable margins so it looks good on a whiteboard.
 - Keep the subject large enough and visually simple enough to remain recognizable after whiteboard rendering.
 - Avoid unnecessary text, labels, frames, watermarks, or captions.
-- Always draw only the requested subject as an isolated PNG-like doodle with a transparent background. Do not add scenery, ground, sky, shadows, props, or decorative background elements.
-- Include a background or setting only when the user's request explicitly names one, and then show only the requested subject together with that requested background.
-- Return only the generated image.
+- ${prefersRealistic ? "Follow the requested scene and background, avoiding unrelated decoration." : "Draw only the requested subject on a plain pure-white background. Do not add scenery, ground, sky, shadows, props, or decorative background elements."}
+- ${prefersRealistic ? "Use a background or setting when the user's request names one." : "Include a background or setting only when the user's request explicitly names one, and then show only the requested subject with that setting."}
+- Return only the generated image as PNG.
       `.trim();
 
   const imageParts: Part[] = [{ text: imageInstructions }];
@@ -1140,6 +1144,7 @@ Rules:
     imageDataUrl: `data:${mimeType};base64,${imageData}`,
     style: prefersRealistic ? "realistic" : "doodle",
     mode,
+    ...(isAdditiveEdit ? { additive: true } : {}),
   };
 }
 

@@ -119,6 +119,9 @@ export interface BoardImageCommand {
   // Helps the router understand whether this came from a new image
   // request or an edit of the existing board image.
   mode: "create" | "edit";
+
+  // Additive doodle edits preserve the existing board and reveal only new ink.
+  additive?: boolean;
 }
 
 export type BoardManagementAction =

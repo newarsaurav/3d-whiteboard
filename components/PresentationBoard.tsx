@@ -253,7 +253,7 @@ type RenderNode = {
   height: number;
 };
 
-const BOARD_BACKGROUND = "#fffef9";
+const BOARD_BACKGROUND = "#ffffff";
 const BOARD_INK = "#172033";
 const BOARD_MUTED = "#5b6474";
 const CHART_COLORS = [
@@ -1680,6 +1680,79 @@ function createFittedImageCanvas(
   return canvas;
 }
 
+function createAdditiveImageLayer(
+  baseCanvas: HTMLCanvasElement,
+  updatedCanvas: HTMLCanvasElement,
+): HTMLCanvasElement {
+  const layer = document.createElement("canvas");
+  layer.width = updatedCanvas.width;
+  layer.height = updatedCanvas.height;
+
+  const baseContext = baseCanvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+  const updatedContext = updatedCanvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+  const layerContext = layer.getContext("2d");
+
+  if (!baseContext || !updatedContext || !layerContext) {
+    return layer;
+  }
+
+  const basePixels = baseContext.getImageData(
+    0,
+    0,
+    layer.width,
+    layer.height,
+  ).data;
+  const updatedPixels = updatedContext.getImageData(
+    0,
+    0,
+    layer.width,
+    layer.height,
+  ).data;
+  const layerPixels = layerContext.createImageData(
+    layer.width,
+    layer.height,
+  );
+
+  for (let index = 0; index < basePixels.length; index += 4) {
+    const baseIsBlank =
+      basePixels[index] > 242 &&
+      basePixels[index + 1] > 242 &&
+      basePixels[index + 2] > 242;
+    const updatedIsInk =
+      updatedPixels[index + 3] > 24 &&
+      (Math.min(
+        updatedPixels[index],
+        updatedPixels[index + 1],
+        updatedPixels[index + 2],
+      ) < 245 ||
+        Math.max(
+          updatedPixels[index],
+          updatedPixels[index + 1],
+          updatedPixels[index + 2],
+        ) -
+          Math.min(
+            updatedPixels[index],
+            updatedPixels[index + 1],
+            updatedPixels[index + 2],
+          ) >
+          18);
+
+    if (baseIsBlank && updatedIsInk) {
+      layerPixels.data[index] = updatedPixels[index];
+      layerPixels.data[index + 1] = updatedPixels[index + 1];
+      layerPixels.data[index + 2] = updatedPixels[index + 2];
+      layerPixels.data[index + 3] = updatedPixels[index + 3];
+    }
+  }
+
+  layerContext.putImageData(layerPixels, 0, 0);
+  return layer;
+}
+
 function deterministicStrokeJitter(seed: number): number {
   const value = Math.sin(seed * 12.9898 + 78.233) * 43758.5453;
   return (value - Math.floor(value)) * 2 - 1;
@@ -2020,6 +2093,216 @@ function resetDoodleRevealPlan(plan: DoodleRevealPlan) {
     plan.revealCanvas.width,
     plan.revealCanvas.height,
   );
+}
+
+type StrokeTestRevealPlan = {
+  points: Point[];
+  revealedCount: number;
+};
+
+function buildStrokeTestRevealPlan(
+  sourceCanvas: HTMLCanvasElement,
+): StrokeTestRevealPlan {
+  const sampleSize = Math.max(
+    1,
+    Math.round((sourceCanvas.width / 900) * 3),
+  );
+  const context = sourceCanvas.getContext("2d", {
+    willReadFrequently: true,
+  });
+
+  if (!context) {
+    return { points: [], revealedCount: 0 };
+  }
+
+  const { width, height } = sourceCanvas;
+  const pixels = context.getImageData(0, 0, width, height).data;
+  const columns = Math.ceil(width / sampleSize);
+  const rows = Math.ceil(height / sampleSize);
+  const ink = new Uint8Array(columns * rows);
+
+  for (let row = 0; row < rows; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      const startX = column * sampleSize;
+      const startY = row * sampleSize;
+      let foundInk = false;
+
+      for (
+        let y = startY;
+        y < Math.min(height, startY + sampleSize) && !foundInk;
+        y += 1
+      ) {
+        for (let x = startX; x < Math.min(width, startX + sampleSize); x += 1) {
+          const pixelIndex = (y * width + x) * 4;
+
+          if (pixels[pixelIndex + 3] <= 24) {
+            continue;
+          }
+
+          const luminance =
+            pixels[pixelIndex] * 0.3 +
+            pixels[pixelIndex + 1] * 0.59 +
+            pixels[pixelIndex + 2] * 0.11;
+
+          if (luminance < 200) {
+            foundInk = true;
+            break;
+          }
+        }
+      }
+
+      if (foundInk) {
+        ink[row * columns + column] = 1;
+      }
+    }
+  }
+
+  const markNearby = (column: number, row: number) => {
+    for (let dy = -1; dy <= 1; dy += 1) {
+      for (let dx = -1; dx <= 1; dx += 1) {
+        const nextColumn = column + dx;
+        const nextRow = row + dy;
+
+        if (
+          nextColumn >= 0 &&
+          nextRow >= 0 &&
+          nextColumn < columns &&
+          nextRow < rows
+        ) {
+          const index = nextRow * columns + nextColumn;
+
+          if (ink[index] === 1) {
+            ink[index] = 2;
+          }
+        }
+      }
+    }
+  };
+
+  const points: Point[] = [];
+  let scanIndex = 0;
+  let currentColumn = -1;
+  let currentRow = -1;
+
+  while (true) {
+    if (currentColumn < 0) {
+      while (scanIndex < ink.length && ink[scanIndex] !== 1) {
+        scanIndex += 1;
+      }
+
+      if (scanIndex >= ink.length) {
+        break;
+      }
+
+      currentColumn = scanIndex % columns;
+      currentRow = Math.floor(scanIndex / columns);
+      markNearby(currentColumn, currentRow);
+      points.push({
+        x: currentColumn * sampleSize + sampleSize / 2,
+        y: currentRow * sampleSize + sampleSize / 2,
+      });
+      continue;
+    }
+
+    let bestDistance = Number.POSITIVE_INFINITY;
+    let bestColumn = -1;
+    let bestRow = -1;
+
+    for (let radius = 2; radius <= 4 && bestDistance === Number.POSITIVE_INFINITY; radius += 1) {
+      for (let dy = -radius; dy <= radius; dy += 1) {
+        for (let dx = -radius; dx <= radius; dx += 1) {
+          if (Math.max(Math.abs(dx), Math.abs(dy)) !== radius) {
+            continue;
+          }
+
+          const nextColumn = currentColumn + dx;
+          const nextRow = currentRow + dy;
+
+          if (
+            nextColumn < 0 ||
+            nextRow < 0 ||
+            nextColumn >= columns ||
+            nextRow >= rows ||
+            ink[nextRow * columns + nextColumn] !== 1
+          ) {
+            continue;
+          }
+
+          const distance = dx * dx + dy * dy;
+
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            bestColumn = nextColumn;
+            bestRow = nextRow;
+          }
+        }
+      }
+    }
+
+    if (bestColumn >= 0) {
+      currentColumn = bestColumn;
+      currentRow = bestRow;
+      markNearby(currentColumn, currentRow);
+      points.push({
+        x: currentColumn * sampleSize + sampleSize / 2,
+        y: currentRow * sampleSize + sampleSize / 2,
+      });
+    } else {
+      currentColumn = -1;
+      currentRow = -1;
+    }
+  }
+
+  return { points, revealedCount: 0 };
+}
+
+function paintStrokeTestDoodleReveal(
+  context: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  sourceCanvas: HTMLCanvasElement,
+  plan: StrokeTestRevealPlan,
+  progress: number,
+) {
+  const targetCount = Math.ceil(
+    plan.points.length * Math.min(1, Math.max(0, progress)),
+  );
+
+  if (targetCount < plan.revealedCount) {
+    context.fillStyle = BOARD_BACKGROUND;
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    plan.revealedCount = 0;
+  }
+
+  if (plan.points.length === 0) {
+    context.save();
+    context.globalAlpha = Math.min(1, Math.max(0, progress));
+    context.drawImage(sourceCanvas, 0, 0, canvas.width, canvas.height);
+    context.restore();
+    return;
+  }
+
+  const patchSize = Math.max(
+    1,
+    Math.round((canvas.width / 900) * 3),
+  ) * 2;
+
+  for (let index = plan.revealedCount; index < targetCount; index += 1) {
+    const point = plan.points[index];
+
+    context.drawImage(
+      sourceCanvas,
+      point.x - patchSize,
+      point.y - patchSize,
+      patchSize * 2,
+      patchSize * 2,
+      point.x - patchSize,
+      point.y - patchSize,
+      patchSize * 2,
+      patchSize * 2,
+    );
+  }
+
+  plan.revealedCount = targetCount;
 }
 
 type TracedStroke = {
@@ -2634,6 +2917,12 @@ function paintImageDoodleReveal(
 function loadBoardImage(
   command: BoardImageCommand,
 ): Promise<HTMLImageElement> {
+  return loadImageDataUrl(command.imageDataUrl);
+}
+
+function loadImageDataUrl(
+  imageDataUrl: string,
+): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const image = new Image();
 
@@ -2645,7 +2934,7 @@ function loadBoardImage(
         ),
       );
 
-    image.src = command.imageDataUrl;
+    image.src = imageDataUrl;
   });
 }
 
@@ -2806,7 +3095,7 @@ export default function PresentationBoard({
       context.globalCompositeOperation =
         "source-over";
 
-      context.fillStyle = "#fffef9";
+      context.fillStyle = BOARD_BACKGROUND;
 
       context.fillRect(
         0,
@@ -2853,6 +3142,7 @@ export default function PresentationBoard({
       targetBoardId: number,
       renderRun: number,
       commandVersion: number,
+      currentDrawing: string | null,
       animateCommand = true,
     ) => {
       if (!drawingCanvas || !context) {
@@ -2920,6 +3210,7 @@ export default function PresentationBoard({
       };
 
       let completed = false;
+      let additiveImageLayer: HTMLCanvasElement | null = null;
 
       if (command.type === "image") {
         const image = await loadBoardImage(command);
@@ -2933,9 +3224,59 @@ export default function PresentationBoard({
           drawingCanvas.width,
           drawingCanvas.height,
         );
+        const isAdditiveDoodle =
+          command.mode === "edit" &&
+          command.additive === true &&
+          command.style === "doodle";
 
-        const doodleRevealPlan =
-          buildDoodleRevealPlan(fittedImage);
+        if (isAdditiveDoodle) {
+          const baseCanvas = document.createElement("canvas");
+          baseCanvas.width = drawingCanvas.width;
+          baseCanvas.height = drawingCanvas.height;
+          const baseContext = baseCanvas.getContext("2d");
+
+          if (baseContext) {
+            if (currentDrawing) {
+              const baseImage = await loadImageDataUrl(currentDrawing);
+
+              if (isCancelled()) {
+                return;
+              }
+
+              baseContext.fillStyle = BOARD_BACKGROUND;
+              baseContext.fillRect(0, 0, baseCanvas.width, baseCanvas.height);
+              baseContext.drawImage(
+                baseImage,
+                0,
+                0,
+                baseCanvas.width,
+                baseCanvas.height,
+              );
+            } else {
+              baseContext.drawImage(drawingCanvas, 0, 0);
+            }
+
+            context.drawImage(baseCanvas, 0, 0);
+            additiveImageLayer = createAdditiveImageLayer(
+              baseCanvas,
+              fittedImage,
+            );
+          }
+        }
+
+        const revealImage = additiveImageLayer ?? fittedImage;
+
+        const useStrokeTestReveal = command.style === "doodle";
+        const strokeTestRevealPlan = useStrokeTestReveal
+          ? buildStrokeTestRevealPlan(revealImage)
+          : null;
+        const doodleRevealPlan = useStrokeTestReveal
+          ? null
+          : buildDoodleRevealPlan(revealImage);
+        const revealPointCount =
+          strokeTestRevealPlan?.points.length ??
+          doodleRevealPlan?.points.length ??
+          0;
 
         const duration = command.style === "doodle"
           ? Math.min(
@@ -2944,7 +3285,7 @@ export default function PresentationBoard({
                 750,
                 480 +
                   drawingUnitMs(drawingSpeedRef.current) *
-                    Math.max(5, doodleRevealPlan.points.length / 70),
+                    Math.max(5, revealPointCount / 70),
               ),
             )
           : Math.min(
@@ -2953,20 +3294,30 @@ export default function PresentationBoard({
                 700,
                 420 +
                   drawingUnitMs(drawingSpeedRef.current) *
-                    Math.max(4, doodleRevealPlan.points.length / 80),
+                    Math.max(4, revealPointCount / 80),
               ),
             );
 
         completed = await animate(
           duration,
           (progress) => {
-            paintImageDoodleReveal(
-              context,
-              drawingCanvas,
-              fittedImage,
-              doodleRevealPlan,
-              progress,
-            );
+            if (strokeTestRevealPlan) {
+              paintStrokeTestDoodleReveal(
+                context,
+                drawingCanvas,
+                revealImage,
+                strokeTestRevealPlan,
+                progress,
+              );
+            } else if (doodleRevealPlan) {
+              paintImageDoodleReveal(
+                context,
+                drawingCanvas,
+                revealImage,
+                doodleRevealPlan,
+                progress,
+              );
+            }
           },
         );
       } else if (command.type === "write_text") {
@@ -3058,11 +3409,15 @@ export default function PresentationBoard({
           return;
         }
 
-        paintBoardImage(
-          context,
-          drawingCanvas,
-          image,
-        );
+        if (additiveImageLayer) {
+          context.drawImage(additiveImageLayer, 0, 0);
+        } else {
+          paintBoardImage(
+            context,
+            drawingCanvas,
+            image,
+          );
+        }
       } else {
         renderBoardCommandToCanvas(
           context,
@@ -3134,12 +3489,20 @@ export default function PresentationBoard({
       completedCommandRenderRef.current[boardId] !==
         generatedCommandVersion;
 
+    const isPendingAdditiveDoodle =
+      generatedCommand?.type === "image" &&
+      generatedCommand.mode === "edit" &&
+      generatedCommand.additive === true &&
+      generatedCommand.style === "doodle";
+
     // If this board has a new Gemini scene waiting to render, do not
     // load an older PNG over it. Start from white and let the
     // structured-command render effect below paint the new scene.
     if (hasPendingAiRender) {
       loadingDrawingRef.current = false;
-      fillBoardWhite();
+      if (!isPendingAdditiveDoodle) {
+        fillBoardWhite();
+      }
       return;
     }
 
@@ -3147,7 +3510,7 @@ export default function PresentationBoard({
 
     context.save();
     context.globalCompositeOperation = "source-over";
-    context.fillStyle = "#fffef9";
+    context.fillStyle = BOARD_BACKGROUND;
     context.fillRect(
       0,
       0,
@@ -3176,7 +3539,7 @@ export default function PresentationBoard({
 
       context.save();
       context.globalCompositeOperation = "source-over";
-      context.fillStyle = "#fffef9";
+      context.fillStyle = BOARD_BACKGROUND;
       context.fillRect(
         0,
         0,
@@ -3283,6 +3646,7 @@ export default function PresentationBoard({
       boardId,
       renderRun,
       generatedCommandVersion,
+      savedDrawing,
       animateCommand,
     ).then(() => {
       if (
@@ -3315,6 +3679,7 @@ export default function PresentationBoard({
   }, [
     generatedCommand,
     generatedCommandVersion,
+    savedDrawing,
     boardId,
     drawingCanvas,
     context,
@@ -3428,7 +3793,7 @@ export default function PresentationBoard({
 
     context.fillStyle =
       tool === "eraser"
-        ? "#fffef9"
+        ? BOARD_BACKGROUND
         : penColor;
 
     context.beginPath();
@@ -3482,7 +3847,7 @@ export default function PresentationBoard({
 
     context.strokeStyle =
       tool === "eraser"
-        ? "#fffef9"
+        ? BOARD_BACKGROUND
         : penColor;
 
     context.lineWidth =

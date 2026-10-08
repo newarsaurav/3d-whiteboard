@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Doodle Live Draw</title>
+<style>
+:root{--bg:#f4f1ea;--fg:#222;--card:#fff;--line:#d8d2c4;--acc:#e0533d;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#1b1a18;--fg:#eee;--card:#262421;--line:#3a3733}}
+:root[data-theme="dark"]{--bg:#1b1a18;--fg:#eee;--card:#262421;--line:#3a3733}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+header{padding:16px 20px 4px}h1{margin:0;font-size:1.3rem}header p{margin:4px 0 0;opacity:.7;font-size:.9rem}
+main{display:grid;grid-template-columns:260px 1fr;gap:16px;padding:16px 20px 24px;max-width:1300px;margin:auto}
+@media(max-width:760px){main{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
+.card h2{margin:0 0 8px;font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;opacity:.65}
+#prevWrap{background:#fff;border-radius:8px;min-height:140px;display:flex;align-items:center;justify-content:center;overflow:hidden}
+#prev{max-width:100%;max-height:200px;display:none}
+#empty{color:#999;font-size:.85rem;padding:12px;text-align:center}
+.ctl{display:flex;flex-direction:column;gap:10px;margin-top:12px}
+button,label.btn{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:9px 12px;font-size:.9rem;cursor:pointer;text-align:center}
+button.alt{background:transparent;color:var(--fg);border:1px solid var(--line)}
+input[type=file]{display:none}
+.row{display:flex;gap:8px}.row button{flex:1}
+label.s{font-size:.8rem;opacity:.8;display:flex;flex-direction:column;gap:4px}
+#wrap{position:relative;background:#fff;border-radius:8px;overflow:hidden;border:1px solid var(--line)}
+#board{display:block;width:100%;height:auto}
+#pen{position:absolute;font-size:26px;pointer-events:none;transform:translate(-8%,-92%);display:none;line-height:1}
+#bar{height:4px;background:var(--line);border-radius:2px;margin-top:8px}#bar i{display:block;height:100%;width:0;background:var(--acc);border-radius:2px}
+</style></head>
+<body>
+<header><h1>Doodle Live Draw</h1><p>Upload a doodle and watch it get drawn on the whiteboard in real time.</p></header>
+<main>
+ <aside class="card">
+  <h2>Original</h2>
+  <div id="prevWrap"><img id="prev" alt="original doodle"><div id="empty">No image yet</div></div>
+  <div class="ctl">
+   <label class="btn">Upload doodle<input type="file" id="file" accept="image/*"></label>
+   <button class="alt" id="sample">Try a sample</button>
+   <label class="s">Speed<input type="range" id="speed" min="1" max="40" value="8"></label>
+   <div class="row"><button id="pause" class="alt">Pause</button><button id="replay">Replay</button></div>
+  </div>
+ </aside>
+ <section class="card">
+  <h2>Whiteboard</h2>
+  <div id="wrap"><canvas id="board" width="900" height="600"></canvas><div id="pen">✏️</div></div>
+  <div id="bar"><i id="fill"></i></div>
+ </section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const board=$('board'),bc=board.getContext('2d'),pen=$('pen');
+const S=3; // sampling step in px
+let src=null,path=[],idx=0,raf=null,paused=false;
+
+function clearBoard(w=board.width,h=board.height){
+  board.width=w;board.height=h;bc.fillStyle='#fff';bc.fillRect(0,0,w,h);
+}
+clearBoard();
+bc.fillStyle='#bbb';bc.font='28px system-ui';bc.textAlign='center';bc.fillText('Upload a doodle to begin',450,300);
+
+function loadImage(url){
+  const img=new Image();
+  img.onload=()=>{
+    $('prev').src=url;$('prev').style.display='block';$('empty').style.display='none';
+    const k=Math.min(2,900/Math.max(img.width,img.height));
+    const w=Math.round(img.width*k),h=Math.round(img.height*k);
+    src=document.createElement('canvas');src.width=w;src.height=h;
+    const c=src.getContext('2d');c.fillStyle='#fff';c.fillRect(0,0,w,h);c.drawImage(img,0,0,w,h);
+    buildPath();play();
+  };
+  img.src=url;
+}
+
+// Turn dark pixels into an ordered pen path (greedy nearest-neighbour walk)
+function buildPath(){
+  const w=src.width,h=src.height,d=src.getContext('2d').getImageData(0,0,w,h).data;
+  const gw=Math.ceil(w/S),gh=Math.ceil(h/S),ink=new Uint8Array(gw*gh);
+  for(let gy=0;gy<gh;gy++)for(let gx=0;gx<gw;gx++){
+    let dark=false;
+    for(let y=gy*S;y<Math.min(h,gy*S+S)&&!dark;y++)for(let x=gx*S;x<Math.min(w,gx*S+S);x++){
+      const p=(y*w+x)*4;if(d[p]*.3+d[p+1]*.59+d[p+2]*.11<200){dark=true;break}
+    }
+    if(dark)ink[gy*gw+gx]=1;
+  }
+  path=[];let scan=0,cx=-1,cy=-1;
+  const mark=(x,y)=>{for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){const nx=x+dx,ny=y+dy;
+    if(nx>=0&&ny>=0&&nx<gw&&ny<gh&&ink[ny*gw+nx]===1)ink[ny*gw+nx]=2}};
+  while(true){
+    if(cx<0){
+      while(scan<ink.length&&ink[scan]!==1)scan++;
+      if(scan>=ink.length)break;
+      cx=scan%gw;cy=(scan/gw)|0;mark(cx,cy);path.push([cx,cy]);continue;
+    }
+    let best=1e9,bx=0,by=0;
+    for(let r=2;r<=4&&best===1e9;r++){
+      for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){
+        if(Math.max(Math.abs(dx),Math.abs(dy))!==r)continue;
+        const nx=cx+dx,ny=cy+dy;
+        if(nx<0||ny<0||nx>=gw||ny>=gh||ink[ny*gw+nx]!==1)continue;
+        const dd=dx*dx+dy*dy;if(dd<best){best=dd;bx=nx;by=ny}
+      }
+    }
+    if(best<1e9){cx=bx;cy=by;mark(cx,cy);path.push([cx,cy])}else cx=-1;
+  }
+}
+
+function play(){
+  cancelAnimationFrame(raf);paused=false;$('pause').textContent='Pause';
+  clearBoard(src.width,src.height);idx=0;pen.style.display='block';tick();
+}
+function tick(){
+  if(paused)return;
+  const n=+$('speed').value,hs=S*2;let x=0,y=0;
+  for(let k=0;k<n&&idx<path.length;k++,idx++){
+    x=path[idx][0]*S+S/2;y=path[idx][1]*S+S/2;
+    bc.drawImage(src,x-hs,y-hs,hs*2,hs*2,x-hs,y-hs,hs*2,hs*2);
+  }
+  const sc=board.clientWidth/board.width;
+  if(x){pen.style.left=x*sc+'px';pen.style.top=y*sc+'px'}
+  $('fill').style.width=(path.length?idx/path.length*100:0)+'%';
+  if(idx<path.length)raf=requestAnimationFrame(tick);
+  else{ // finish: show the exact original
+    bc.drawImage(src,0,0);pen.style.display='none';$('fill').style.width='100%';
+  }
+}
+
+$('file').onchange=e=>{const f=e.target.files[0];if(f)loadImage(URL.createObjectURL(f))};
+$('replay').onclick=()=>{if(src)play()};
+$('pause').onclick=()=>{
+  if(!src||idx>=path.length)return;
+  paused=!paused;$('pause').textContent=paused?'Resume':'Pause';if(!paused)tick();
+};
+$('sample').onclick=()=>{
+  const c=document.createElement('canvas');c.width=600;c.height=450;
+  const x=c.getContext('2d');x.fillStyle='#fff';x.fillRect(0,0,600,450);
+  x.strokeStyle='#222';x.lineWidth=5;x.lineCap=x.lineJoin='round';
+  x.beginPath();x.arc(150,150,90,0,7);x.stroke();
+  x.beginPath();x.arc(120,125,8,0,7);x.arc(180,125,8,0,7);x.stroke();
+  x.beginPath();x.arc(150,160,45,.15*Math.PI,.85*Math.PI);x.stroke();
+  x.beginPath();for(let i=0;i<10;i++){const a=i*Math.PI/5-Math.PI/2,r=i%2?35:80;x.lineTo(430+r*Math.cos(a),130+r*Math.sin(a))}x.closePath();x.stroke();
+  x.beginPath();for(let t=0;t<30;t+=.2){const r=4*t;x.lineTo(300+r*Math.cos(t),340+r*Math.sin(t)*.8)}x.stroke();
+  x.beginPath();x.moveTo(60,420);x.bezierCurveTo(200,360,400,460,560,400);x.stroke();
+  loadImage(c.toDataURL());
+};
+</script>
+</body></html>
