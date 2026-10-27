@@ -65,6 +65,8 @@ import type {
   Board,
   BoardCommand,
   BoardManagementCommand,
+  BoardTextCommand,
+  BoardTextEdit,
   TeacherLessonCommand,
 } from "@/types/board";
 
@@ -376,6 +378,77 @@ function appendTextCommand(
       .filter((note): note is string => Boolean(note?.trim()))
       .join(" "),
   };
+}
+
+function applyTextEdit(
+  current: BoardTextCommand,
+  edit: BoardTextEdit,
+): BoardTextCommand {
+  if (edit.action === "append_points") {
+    const points = edit.points ?? [];
+    if (current.bullets.length + points.length > 8) {
+      throw new Error("There is not enough room for more points on this board.");
+    }
+    return { ...current, bullets: [...current.bullets, ...points] };
+  }
+
+  const target = edit.target?.trim();
+  if (!target) {
+    throw new Error("Tell me which board text to change.");
+  }
+
+  const containsTarget = [
+    current.title,
+    ...current.bullets,
+    ...(current.formulas ?? []),
+    current.note ?? "",
+  ].some((text) => text.toLowerCase().includes(target.toLowerCase()));
+  if (!containsTarget) {
+    throw new Error(`I could not find “${target}” on the current board.`);
+  }
+
+  if (edit.action === "explain") {
+    const explanation = edit.explanation?.trim();
+    if (!explanation) {
+      throw new Error("No explanation was returned.");
+    }
+    if (current.bullets.length >= 8) {
+      throw new Error("There is not enough room to add an explanation on this board.");
+    }
+    return {
+      ...current,
+      bullets: [...current.bullets, `About ${target}: ${explanation}`],
+    };
+  }
+
+  if (!edit.style) {
+    throw new Error("No text mark style was returned.");
+  }
+  const markerStart = edit.style === "underline"
+    ? "__"
+    : edit.style === "circle"
+      ? "[[circle]]"
+      : `[color=${edit.color}]`;
+  const markerEnd = edit.style === "underline"
+    ? "__"
+    : edit.style === "circle"
+      ? "[[/circle]]"
+      : "[/color]";
+  let changed = false;
+  const markText = (text: string | undefined) => {
+    if (changed || !text) return text;
+    const index = text.toLowerCase().indexOf(target.toLowerCase());
+    if (index < 0) return text;
+    changed = true;
+    return `${text.slice(0, index)}${markerStart}${text.slice(index, index + target.length)}${markerEnd}${text.slice(index + target.length)}`;
+  };
+
+  const title = markText(current.title) ?? current.title;
+  const bullets = current.bullets.map((bullet) => markText(bullet) ?? bullet);
+  const formulas = current.formulas?.map((formula) => markText(formula) ?? formula);
+  const note = markText(current.note);
+
+  return { ...current, title, bullets, formulas, note };
 }
 
 function appendLessonToTextCommand(
@@ -735,6 +808,13 @@ export default function LixiaStudio() {
       generatedCommandVersion: 0,
     },
   ]);
+  const textAnnotationVersionRef = useRef(0);
+  const [textAnnotation, setTextAnnotation] = useState<{
+    boardId: number;
+    target: string;
+    style: "underline" | "circle";
+    version: number;
+  } | null>(null);
 
   const activeBoard = useMemo(() => {
 
@@ -1325,6 +1405,8 @@ export default function LixiaStudio() {
 
   async function speakSingleBoardResponse(
     command: BoardCommand,
+    boardId: number,
+    version: number,
     language = "en-US",
   ) {
     const narration = buildSpokenResponse(command);
@@ -1353,10 +1435,25 @@ export default function LixiaStudio() {
     }
 
     try {
-      // Let React paint the board update before Lixia begins speaking.
-      await new Promise<void>((resolve) => {
-        window.setTimeout(resolve, 120);
-      });
+      if (runId !== teachingRunRef.current) {
+        return;
+      }
+
+      const boardRendered = await waitForBoardRender(
+        boardId,
+        version,
+      );
+
+      if (runId !== teachingRunRef.current) {
+        return;
+      }
+
+      if (!boardRendered) {
+        setAssistantError(
+          "The board update could not be rendered, so I did not announce it as complete.",
+        );
+        return;
+      }
 
       if (runId !== teachingRunRef.current) {
         return;
@@ -1396,32 +1493,26 @@ export default function LixiaStudio() {
   function waitForBoardRender(
     boardId: number,
     version: number,
-    runId: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     return new Promise((resolve) => {
       const key = `${boardId}:${version}`;
       let settled = false;
 
-      const finish = () => {
+      const finish = (rendered: boolean) => {
         if (settled) {
           return;
         }
 
         settled = true;
         boardRenderWaitersRef.current.delete(key);
-        resolve();
+        resolve(rendered);
       };
 
-      boardRenderWaitersRef.current.set(key, finish);
+      boardRenderWaitersRef.current.set(key, () => finish(true));
 
       // Safety timeout only. Normal completion comes from PresentationBoard.
       window.setTimeout(() => {
-        if (runId !== teachingRunRef.current) {
-          finish();
-          return;
-        }
-
-        finish();
+        finish(false);
       }, 45000);
     });
   }
@@ -1465,12 +1556,6 @@ export default function LixiaStudio() {
 
         boardVersionRef.current[boardId] = nextVersion;
 
-        const boardFinished = waitForBoardRender(
-          boardId,
-          nextVersion,
-          runId,
-        );
-
         setBoards((currentBoards) =>
           currentBoards.map((board) =>
             board.id === boardId
@@ -1511,8 +1596,8 @@ export default function LixiaStudio() {
           runId,
           gestureIntent,
           segmentIndex,
-          segment.emotion,
-          segment.reaction,
+          // segment.emotion,
+          // segment.reaction,
         );
 
 // <!--         conflict changed 
@@ -1775,6 +1860,7 @@ export default function LixiaStudio() {
       const data = (await response.json()) as {
         tool?: string;
         command?: BoardCommand | TeacherLessonCommand;
+        textEdit?: BoardTextEdit;
         management?: BoardManagementCommand;
         error?: string;
       };
@@ -1834,9 +1920,73 @@ export default function LixiaStudio() {
                 : board,
             ),
           );
-          void speakSingleBoardResponse(newCommand);
+          void speakSingleBoardResponse(
+            newCommand,
+            newBoardId,
+            nextVersion,
+          );
         }
 
+        setAssistantPrompt("");
+        return;
+      }
+
+      if (data.textEdit) {
+        const currentCommand = targetBoard.generatedCommand;
+        if (currentCommand?.type !== "write_text") {
+          throw new Error("Text edits are available when the current board contains text.");
+        }
+
+        if (
+          data.textEdit.action === "mark" &&
+          (data.textEdit.style === "underline" || data.textEdit.style === "circle")
+        ) {
+          setTextAnnotation({
+            boardId: targetBoardId,
+            target: data.textEdit.target ?? "",
+            style: data.textEdit.style,
+            version: ++textAnnotationVersionRef.current,
+          });
+
+          const spokenUpdate: BoardCommand = {
+            type: "write_text",
+            title: "",
+            bullets: [`Marked ${data.textEdit.target ?? "the selected phrase"}.`],
+          };
+          void speakSingleBoardResponse(
+            spokenUpdate,
+            targetBoardId,
+            targetBoard.generatedCommandVersion,
+          );
+          setAssistantPrompt("");
+          return;
+        }
+
+        const updatedCommand = applyTextEdit(currentCommand, data.textEdit);
+        const nextVersion = targetBoard.generatedCommandVersion + 1;
+        boardVersionRef.current[targetBoardId] = nextVersion;
+        setBoards((currentBoards) =>
+          currentBoards.map((board) =>
+            board.id === targetBoardId
+              ? {
+                  ...board,
+                  generatedCommand: updatedCommand,
+                  generatedCommandVersion: nextVersion,
+                }
+              : board,
+          ),
+        );
+
+        const spokenUpdate: BoardCommand = {
+          type: "write_text",
+          title: "",
+          bullets: data.textEdit.action === "append_points"
+            ? data.textEdit.points ?? []
+            : data.textEdit.action === "explain"
+              ? [data.textEdit.explanation ?? ""]
+              : [`Marked ${data.textEdit.target ?? "the selected phrase"}.`],
+        };
+        void speakSingleBoardResponse(spokenUpdate, targetBoardId, nextVersion);
         setAssistantPrompt("");
         return;
       }
@@ -1943,7 +2093,11 @@ export default function LixiaStudio() {
       // Every normal response is spoken too. The existing structured
       // command becomes a concise narration, so this adds no extra
       // Gemini reasoning call before TTS starts.
-      void speakSingleBoardResponse(command);
+      void speakSingleBoardResponse(
+        command,
+        commandTargetBoardId,
+        nextVersion,
+      );
 
       setAssistantPrompt("");
     } catch (error) {
@@ -2485,6 +2639,7 @@ export default function LixiaStudio() {
             generatedCommandVersion={
               activeBoard.generatedCommandVersion
             }
+            textAnnotation={textAnnotation}
             textSize={textSize}
             writingSpeed={writingSpeed}
             drawingSpeed={drawingSpeed}

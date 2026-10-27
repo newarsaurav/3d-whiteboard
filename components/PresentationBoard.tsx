@@ -43,6 +43,12 @@ interface PresentationBoardProps {
 
   generatedCommand: BoardCommand | null;
   generatedCommandVersion: number;
+  textAnnotation: {
+    boardId: number;
+    target: string;
+    style: "underline" | "circle";
+    version: number;
+  } | null;
   textSize: TextSize;
 
   // 10 = slow, 100 = fast.
@@ -65,6 +71,13 @@ interface PresentationBoardProps {
 type Point = {
   x: number;
   y: number;
+};
+
+type TextMarkRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 };
 
 
@@ -349,6 +362,7 @@ type StyledTextToken = {
   bold: boolean;
   italic: boolean;
   underline: boolean;
+  circle: boolean;
   color?: string;
 };
 
@@ -357,10 +371,11 @@ function parseStyledText(
   formatting: BoardTextFormatting | undefined,
 ): StyledTextToken[] {
   const tokens: StyledTextToken[] = [];
-  const markerPattern = /(\*\*|__|\*|_|\[color=#[0-9a-fA-F]{6}\]|\[\/color\])/g;
+  const markerPattern = /(\[\[circle\]\]|\[\[\/circle\]\]|\*\*|__|\*|_|\[color=#[0-9a-fA-F]{6}\]|\[\/color\])/g;
   let bold = formatting?.bold ?? false;
   let italic = formatting?.italic ?? false;
   let underline = formatting?.underline ?? false;
+  let circle = false;
   let color = formatting?.textColor;
   let cursor = 0;
 
@@ -368,21 +383,23 @@ function parseStyledText(
     const marker = match[0];
     const index = match.index ?? 0;
     if (index > cursor) {
-      tokens.push({ text: text.slice(cursor, index), bold, italic, underline, color });
+      tokens.push({ text: text.slice(cursor, index), bold, italic, underline, circle, color });
     }
     if (marker === "**") bold = !bold;
     else if (marker === "__") underline = !underline;
     else if (marker === "*") italic = !italic;
     else if (marker === "_") underline = !underline;
+    else if (marker === "[[circle]]") circle = true;
+    else if (marker === "[[/circle]]") circle = false;
     else if (marker === "[/color]") color = formatting?.textColor;
     else color = marker.slice(7, -1);
     cursor = index + marker.length;
   }
 
   if (cursor < text.length) {
-    tokens.push({ text: text.slice(cursor), bold, italic, underline, color });
+    tokens.push({ text: text.slice(cursor), bold, italic, underline, circle, color });
   }
-  return tokens.length > 0 ? tokens : [{ text: "", bold, italic, underline, color }];
+  return tokens.length > 0 ? tokens : [{ text: "", bold, italic, underline, circle, color }];
 }
 
 function drawStyledWrappedText(
@@ -422,14 +439,51 @@ function drawStyledWrappedText(
   context.textAlign = "left";
   context.textBaseline = "top";
   visibleLines.forEach((line, lineIndex) => {
+    let measureX = x;
+    let circleStart: number | null = null;
+    let circleEnd = x;
+    const textY = y + lineIndex * lineHeight;
+    const closeCircle = () => {
+      if (circleStart === null) return;
+      context.save();
+      context.strokeStyle = "#ef4444";
+      context.lineWidth = 3;
+      context.beginPath();
+      context.ellipse(
+        (circleStart + circleEnd) / 2,
+        textY + sizeInPx / 2,
+        Math.max(10, (circleEnd - circleStart + 16) / 2),
+        sizeInPx * 0.72,
+        0,
+        0,
+        Math.PI * 2,
+      );
+      context.stroke();
+      context.restore();
+      circleStart = null;
+    };
+
+    for (const token of line) {
+      context.font = tokenFont(token);
+      const width = context.measureText(token.text).width;
+      if (token.circle) {
+        circleStart ??= measureX;
+        circleEnd = measureX + width;
+      } else {
+        closeCircle();
+      }
+      measureX += width;
+    }
+    closeCircle();
+
     let offsetX = x;
     for (const token of line) {
       context.font = tokenFont(token);
       context.fillStyle = token.color || formatting?.textColor || BOARD_INK;
-      context.fillText(token.text, offsetX, y + lineIndex * lineHeight);
+      context.fillText(token.text, offsetX, textY);
       const width = context.measureText(token.text).width;
       if (token.underline && token.text.trim()) {
-        context.fillRect(offsetX, y + lineIndex * lineHeight + sizeInPx + 3, width, 2);
+        context.fillRect(offsetX, textY + sizeInPx + 3, width, 2);
       }
       offsetX += width;
     }
@@ -480,7 +534,7 @@ function renderTextCommand(
   );
 
   for (const bullet of command.bullets.slice(0, 8)) {
-    const lines = getWrappedLines(context, bullet.replace(/\*\*|__|\*|_|\[color=#[0-9a-fA-F]{6}\]|\[\/color\]/g, ""), CANVAS_WIDTH - 250);
+    const lines = getWrappedLines(context, bullet.replace(/\[\[\/?circle\]\]|\*\*|__|\*|_|\[color=#[0-9a-fA-F]{6}\]|\[\/color\]/g, ""), CANVAS_WIDTH - 250);
 
     if (currentY + lines.length * 54 * sizeScale > 760) {
       break;
@@ -673,7 +727,7 @@ function drawArrow(
     const middleX = (start.x + end.x) / 2;
     const middleY = (start.y + end.y) / 2;
 
-    context.font = '600 25px "Segoe UI", sans-serif';
+    context.font = getFontString(undefined, "600", 25);
     const width = context.measureText(label).width + 22;
 
     context.fillStyle = BOARD_BACKGROUND;
@@ -1033,7 +1087,7 @@ function renderCartesianChart(
 
   if (values.length === 0) {
     context.fillStyle = BOARD_INK;
-    context.font = '36px "Segoe UI", sans-serif';
+    context.font = getFontString(undefined, "400", 36);
     context.fillText("No numeric chart data was returned.", 100, 220);
     return;
   }
@@ -1057,7 +1111,7 @@ function renderCartesianChart(
   const yTicks = 5;
 
   context.save();
-  context.font = '24px "Segoe UI", sans-serif';
+  context.font = getFontString(undefined, "400", 24);
   context.textBaseline = "middle";
 
   for (let index = 0; index <= yTicks; index += 1) {
@@ -1102,7 +1156,7 @@ function renderCartesianChart(
     const x = chartLeft + stepX * (index + 0.5);
 
     context.fillStyle = BOARD_MUTED;
-    context.font = '22px "Segoe UI", sans-serif';
+    context.font = getFontString(undefined, "400", 22);
     context.textAlign = "center";
     context.textBaseline = "top";
     context.fillText(
@@ -1206,7 +1260,7 @@ function renderCartesianChart(
     });
   }
 
-  context.font = '600 23px "Segoe UI", sans-serif';
+  context.font = getFontString(undefined, "600", 23);
   context.textAlign = "left";
   context.textBaseline = "middle";
 
@@ -1231,7 +1285,7 @@ function renderCartesianChart(
     context.translate(34, chartTop + chartHeight / 2);
     context.rotate(-Math.PI / 2);
     context.fillStyle = BOARD_MUTED;
-    context.font = '600 23px "Segoe UI", sans-serif';
+    context.font = getFontString(undefined, "600", 23);
     context.textAlign = "center";
     context.fillText(command.yAxisLabel, 0, 0);
     context.restore();
@@ -1239,7 +1293,7 @@ function renderCartesianChart(
 
   if (command.xAxisLabel) {
     context.fillStyle = BOARD_MUTED;
-    context.font = '600 23px "Segoe UI", sans-serif';
+    context.font = getFontString(undefined, "600", 23);
     context.textAlign = "center";
     context.textBaseline = "top";
     context.fillText(
@@ -1284,7 +1338,7 @@ function renderPieChart(
 
   if (total <= 0) {
     context.fillStyle = BOARD_INK;
-    context.font = '36px "Segoe UI", sans-serif';
+    context.font = getFontString(undefined, "400", 36);
     context.fillText("No positive pie-chart data was returned.", 100, 220);
     return;
   }
@@ -1313,7 +1367,7 @@ function renderPieChart(
     startAngle += angle;
   });
 
-  context.font = '600 28px "Segoe UI", sans-serif';
+  context.font = getFontString(undefined, "600", 28);
   context.textAlign = "left";
   context.textBaseline = "middle";
 
@@ -1338,7 +1392,7 @@ function renderChartCommand(
   command: BoardChartCommand,
 ) {
   context.fillStyle = "#312e81";
-  context.font = '700 52px "Segoe UI", sans-serif';
+  context.font = `700 52px ${AVAILABLE_FONTS[DEFAULT_FONT]}`;
   context.textAlign = "left";
   context.textBaseline = "top";
 
@@ -1354,7 +1408,7 @@ function renderChartCommand(
 
   if (command.subtitle) {
     context.fillStyle = BOARD_MUTED;
-    context.font = '25px "Segoe UI", sans-serif';
+    context.font = getFontString(undefined, "400", 25);
     context.fillText(
       command.subtitle,
       92,
@@ -1389,7 +1443,7 @@ function renderChartCommand(
 
   if (footerParts.length > 0) {
     context.fillStyle = "#64748b";
-    context.font = '22px "Segoe UI", sans-serif';
+    context.font = getFontString(undefined, "400", 22);
     context.textAlign = "left";
     context.textBaseline = "bottom";
     context.fillText(
@@ -1816,14 +1870,8 @@ function isInkPixel(
   const darkest = Math.min(red, green, blue);
   const lightest = Math.max(red, green, blue);
   const saturation = lightest - darkest;
-  const distanceFromWhite =
-    (255 - red) + (255 - green) + (255 - blue);
 
-  return (
-    darkest < 232 ||
-    saturation > 24 ||
-    distanceFromWhite > 55
-  );
+  return darkest < 245 || saturation > 18;
 }
 
 function buildDoodleRevealPlan(
@@ -2164,12 +2212,14 @@ function buildStrokeTestRevealPlan(
             continue;
           }
 
-          const luminance =
-            pixels[pixelIndex] * 0.3 +
-            pixels[pixelIndex + 1] * 0.59 +
-            pixels[pixelIndex + 2] * 0.11;
-
-          if (luminance < 200) {
+          if (
+            isInkPixel(
+              pixels[pixelIndex],
+              pixels[pixelIndex + 1],
+              pixels[pixelIndex + 2],
+              pixels[pixelIndex + 3],
+            )
+          ) {
             foundInk = true;
             break;
           }
@@ -3008,6 +3058,7 @@ export default function PresentationBoard({
   savedDrawing,
   generatedCommand,
   generatedCommandVersion,
+  textAnnotation,
   textSize,
   writingSpeed,
   drawingSpeed,
@@ -3031,6 +3082,11 @@ export default function PresentationBoard({
 
   const completedCommandRenderRef =
     useRef<Record<number, number>>({});
+  const completedTextAnnotationRef = useRef(0);
+  const localAnnotationSnapshotRef = useRef<{
+    boardId: number;
+    drawing: string;
+  } | null>(null);
 
   const drawingLoadRunRef = useRef(0);
   const commandRenderRunRef = useRef(0);
@@ -3180,7 +3236,8 @@ export default function PresentationBoard({
 
       if (
         command.type === "write_text" ||
-        command.type === "flowchart"
+        command.type === "flowchart" ||
+        command.type === "chart"
       ) {
         await document.fonts.load(
           '400 42px "Lixia Handwriting"',
@@ -3287,9 +3344,7 @@ export default function PresentationBoard({
               fittedImage,
             );
 
-            if (
-              !hasVisibleImagePixels(additiveImageLayer)
-            ) {
+            if (!hasVisibleImagePixels(additiveImageLayer)) {
               additiveImageLayer = null;
             }
           }
@@ -3506,6 +3561,17 @@ export default function PresentationBoard({
   useEffect(() => {
     activeBoardIdRef.current = boardId;
 
+    const localSnapshot = localAnnotationSnapshotRef.current;
+    if (localSnapshot) {
+      if (localSnapshot.boardId === boardId && localSnapshot.drawing === savedDrawing) {
+        localAnnotationSnapshotRef.current = null;
+        return;
+      }
+      if (localSnapshot.boardId !== boardId) {
+        localAnnotationSnapshotRef.current = null;
+      }
+    }
+
     // Cancel any pending render/load work that belonged to the previous board.
     const loadRun = ++drawingLoadRunRef.current;
     commandRenderRunRef.current += 1;
@@ -3525,13 +3591,16 @@ export default function PresentationBoard({
       generatedCommand.mode === "edit" &&
       generatedCommand.additive === true &&
       generatedCommand.style === "doodle";
+    const isPendingTextUpdate =
+      generatedCommand?.type === "write_text" &&
+      completedCommandRenderRef.current[boardId] !== undefined;
 
     // If this board has a new Gemini scene waiting to render, do not
     // load an older PNG over it. Start from white and let the
     // structured-command render effect below paint the new scene.
     if (hasPendingAiRender) {
       loadingDrawingRef.current = false;
-      if (!isPendingAdditiveDoodle) {
+      if (!isPendingAdditiveDoodle && !isPendingTextUpdate) {
         fillBoardWhite();
       }
       return;
@@ -3716,6 +3785,54 @@ export default function PresentationBoard({
     context,
     renderCommandToBoard,
     textSize,
+  ]);
+
+  useEffect(() => {
+    if (
+      !textAnnotation ||
+      textAnnotation.boardId !== boardId ||
+      textAnnotation.version <= completedTextAnnotationRef.current ||
+      generatedCommand?.type !== "write_text" ||
+      !drawingCanvas ||
+      !context
+    ) {
+      return;
+    }
+
+    completedTextAnnotationRef.current = textAnnotation.version;
+    const rects = getTextMarkRects(
+      context,
+      generatedCommand,
+      textAnnotation.target,
+      textSize,
+    );
+    if (rects.length === 0) return;
+
+    const strokes = createHumanMarkStrokes(rects, textAnnotation.style);
+    return animateHumanTextMark(
+      drawingCanvas,
+      context,
+      texture,
+      strokes,
+      () => activeBoardIdRef.current === textAnnotation.boardId,
+      () => {
+        const drawing = drawingCanvas.toDataURL("image/png");
+        localAnnotationSnapshotRef.current = {
+          boardId: textAnnotation.boardId,
+          drawing,
+        };
+        onDrawingChange(textAnnotation.boardId, drawing);
+      },
+    );
+  }, [
+    textAnnotation,
+    boardId,
+    generatedCommand,
+    drawingCanvas,
+    context,
+    texture,
+    textSize,
+    onDrawingChange,
   ]);
 
   /*
@@ -4141,4 +4258,227 @@ export default function PresentationBoard({
       />
     </group>
   );
+}
+
+function getTextMarkRects(
+  context: CanvasRenderingContext2D,
+  command: BoardTextCommand,
+  target: string,
+  textSize: TextSize,
+): TextMarkRect[] {
+  const marginX = 95;
+  const sizeScale = { small: 0.8, medium: 1, large: 1.2 }[textSize];
+  const markerPattern = /\[\[\/?circle\]\]|\*\*|__|\*|_|\[color=#[0-9a-fA-F]{6}\]|\[\/color\]/g;
+  const normalizedTarget = target.replace(/\s+/g, " ").trim().toLocaleLowerCase();
+  if (!normalizedTarget) return [];
+
+  const rects: TextMarkRect[] = [];
+  const appendTextRects = (
+    source: string,
+    x: number,
+    y: number,
+    maxWidth: number,
+    lineHeight: number,
+    sizeInPx: number,
+    weight: "400" | "600",
+    maxLines: number,
+  ) => {
+    const plainText = source.replace(markerPattern, "").replace(/\s+/g, " ").trim();
+    const targetStart = plainText.toLocaleLowerCase().indexOf(normalizedTarget);
+    if (targetStart < 0) return;
+    const targetEnd = targetStart + normalizedTarget.length;
+    context.font = getFontString(command.font, weight, sizeInPx);
+    const lines = getWrappedLines(context, plainText, maxWidth).slice(0, maxLines);
+    let searchFrom = 0;
+
+    lines.forEach((line, lineIndex) => {
+      const lineStart = plainText.indexOf(line, searchFrom);
+      if (lineStart < 0) return;
+      const lineEnd = lineStart + line.length;
+      const segmentStart = Math.max(targetStart, lineStart);
+      const segmentEnd = Math.min(targetEnd, lineEnd);
+      if (segmentStart < segmentEnd) {
+        const prefix = plainText.slice(lineStart, segmentStart);
+        const segment = plainText.slice(segmentStart, segmentEnd);
+        rects.push({
+          x: x + context.measureText(prefix).width,
+          y: y + lineIndex * lineHeight,
+          width: context.measureText(segment).width,
+          height: sizeInPx,
+        });
+      }
+      searchFrom = lineEnd;
+    });
+  };
+
+  context.font = getFontString(command.font, "600", 64 * sizeScale);
+  const titleLines = getWrappedLines(
+    context,
+    command.title.replace(markerPattern, ""),
+    CANVAS_WIDTH - marginX * 2,
+  ).slice(0, 2);
+  appendTextRects(command.title, marginX, 62, CANVAS_WIDTH - marginX * 2, 72 * sizeScale, 64 * sizeScale, "600", 2);
+
+  let currentY = 62 + Math.max(1, titleLines.length) * 78 * sizeScale + 24;
+  context.font = getFontString(command.font, "400", 42 * sizeScale);
+  for (const bullet of command.bullets.slice(0, 8)) {
+    const plainBullet = bullet.replace(markerPattern, "");
+    const lines = getWrappedLines(context, plainBullet, CANVAS_WIDTH - 250);
+    if (currentY + lines.length * 54 * sizeScale > 760) break;
+    appendTextRects(bullet, marginX + 42, currentY, CANVAS_WIDTH - 250, 54 * sizeScale, 42 * sizeScale, "400", lines.length);
+    currentY += Math.max(1, lines.length) * 54 * sizeScale + 18;
+  }
+
+  if (command.formulas && command.formulas.length > 0 && currentY < 730) {
+    currentY += 48 * sizeScale;
+    for (const formula of command.formulas.slice(0, 4)) {
+      if (currentY + 78 * sizeScale > 770) break;
+      appendTextRects(
+        formula,
+        marginX + 28,
+        currentY + 11 * sizeScale,
+        CANVAS_WIDTH - marginX * 2 - 56,
+        46 * sizeScale,
+        46 * sizeScale,
+        "600",
+        1,
+      );
+      currentY += 82 * sizeScale;
+    }
+  }
+
+  if (command.note && currentY < 785) {
+    context.font = getFontString(command.font, "600", 32 * sizeScale);
+    const noteLines = getWrappedLines(
+      context,
+      command.note.replace(markerPattern, ""),
+      CANVAS_WIDTH - marginX * 2 - 56,
+    ).slice(0, 2);
+    const noteTop = Math.min(currentY + 52, 806) - ((noteLines.length - 1) / 2) * 34 * sizeScale - 16 * sizeScale;
+    appendTextRects(
+      command.note,
+      marginX + 28,
+      noteTop,
+      CANVAS_WIDTH - marginX * 2 - 56,
+      34 * sizeScale,
+      32 * sizeScale,
+      "600",
+      2,
+    );
+  }
+
+  return rects;
+}
+
+function createHumanMarkStrokes(
+  rects: TextMarkRect[],
+  style: "underline" | "circle",
+): Point[][] {
+  return rects.map((rect, rectIndex) => {
+    const points: Point[] = [];
+    const steps = style === "circle" ? 56 : Math.max(20, Math.ceil(rect.width / 5));
+    const centerX = rect.x + rect.width / 2;
+    const centerY = rect.y + rect.height / 2;
+    const radiusX = rect.width / 2 + 9;
+    const radiusY = rect.height * 0.72;
+
+    for (let index = 0; index <= steps; index += 1) {
+      const progress = index / steps;
+      if (style === "circle") {
+        const angle = progress * Math.PI * 2 - Math.PI / 2;
+        const wobble = Math.sin(angle * 3 + rectIndex) * 1.4;
+        points.push({
+          x: centerX + Math.cos(angle) * (radiusX + wobble),
+          y: centerY + Math.sin(angle) * (radiusY + wobble),
+        });
+      } else {
+        points.push({
+          x: rect.x - 2 + progress * (rect.width + 4),
+          y: rect.y + rect.height + 4 + Math.sin(progress * Math.PI * 4 + rectIndex) * 1.8,
+        });
+      }
+    }
+    return points;
+  });
+}
+
+function animateHumanTextMark(
+  canvas: HTMLCanvasElement,
+  context: CanvasRenderingContext2D,
+  texture: THREE.CanvasTexture | null,
+  strokes: Point[][],
+  isActive: () => boolean,
+  onComplete: () => void,
+): () => void {
+  const baseCanvas = document.createElement("canvas");
+  baseCanvas.width = canvas.width;
+  baseCanvas.height = canvas.height;
+  baseCanvas.getContext("2d")?.drawImage(canvas, 0, 0);
+
+  const totalSegments = strokes.reduce(
+    (total, stroke) => total + Math.max(0, stroke.length - 1),
+    0,
+  );
+  const durationMs = Math.max(650, totalSegments * 12);
+  let animationFrame = 0;
+  let startTime: number | null = null;
+  let cancelled = false;
+
+  const drawFrame = (timestamp: number) => {
+    if (cancelled || !isActive()) return;
+    startTime ??= timestamp;
+    const progress = Math.min(1, (timestamp - startTime) / durationMs);
+    const revealedSegments = progress * totalSegments;
+
+    context.clearRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(baseCanvas, 0, 0);
+    context.save();
+    context.strokeStyle = "#dc2626";
+    context.lineWidth = 4;
+    context.lineCap = "round";
+    context.lineJoin = "round";
+
+    let consumedSegments = 0;
+    for (const stroke of strokes) {
+      const segmentCount = stroke.length - 1;
+      const visibleSegments = Math.max(
+        0,
+        Math.min(segmentCount, revealedSegments - consumedSegments),
+      );
+      if (visibleSegments > 0) {
+        const fullSegments = Math.floor(visibleSegments);
+        context.beginPath();
+        context.moveTo(stroke[0].x, stroke[0].y);
+        for (let index = 1; index <= fullSegments; index += 1) {
+          context.lineTo(stroke[index].x, stroke[index].y);
+        }
+        if (fullSegments < segmentCount && visibleSegments > fullSegments) {
+          const from = stroke[fullSegments];
+          const to = stroke[fullSegments + 1];
+          const fraction = visibleSegments - fullSegments;
+          context.lineTo(
+            from.x + (to.x - from.x) * fraction,
+            from.y + (to.y - from.y) * fraction,
+          );
+        }
+        context.stroke();
+      }
+      consumedSegments += segmentCount;
+    }
+
+    context.restore();
+    if (texture) texture.needsUpdate = true;
+
+    if (progress < 1) {
+      animationFrame = requestAnimationFrame(drawFrame);
+    } else {
+      onComplete();
+    }
+  };
+
+  animationFrame = requestAnimationFrame(drawFrame);
+  return () => {
+    cancelled = true;
+    cancelAnimationFrame(animationFrame);
+  };
 }

@@ -18,7 +18,7 @@ export const AVAILABLE_FONTS: Record<FontFamily, string> = {
   "cursive": '"Brush Script MT", cursive',
 };
 
-export const DEFAULT_FONT: FontFamily = "sans-serif";
+export const DEFAULT_FONT: FontFamily = "handwriting";
 
 export interface BoardTextFormatting {
   backgroundColor?: string;
@@ -27,6 +27,15 @@ export interface BoardTextFormatting {
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
+}
+
+export interface BoardTextEdit {
+  action: "append_points" | "mark" | "explain";
+  points?: string[];
+  target?: string;
+  style?: "underline" | "circle" | "color";
+  color?: string;
+  explanation?: string;
 }
 
 export interface FlowchartNode {
@@ -64,15 +73,6 @@ export interface TeacherLessonSegment {
   // e.g. "explain", "emphasize", "point"). Optional — the studio
   // falls back to a rotation of teaching gestures when absent.
   gesture?: string;
-
-  // Facial expression Mike wears while this segment is narrated
-  // (e.g. "happy", "surprised", "serious", "thinking"). Optional — the
-  // studio derives a mild one from the gesture when absent.
-  emotion?: string;
-
-  // Optional short physical reaction at the start of the segment
-  // ("laugh", "hm", "surprise", "nod", "shrug"). Most segments omit it.
-  reaction?: string;
 }
 
 export interface TeacherLessonCommand {

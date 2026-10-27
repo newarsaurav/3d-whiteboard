@@ -2,7 +2,6 @@ import {
   FunctionCallingConfigMode,
   GoogleGenAI,
   type FunctionDeclaration,
-  type GenerateContentConfig,
   type Part,
 } from "@google/genai";
 import { NextResponse } from "next/server";
@@ -14,6 +13,7 @@ import type {
   BoardImageCommand,
   BoardManagementCommand,
   BoardTextCommand,
+  BoardTextEdit,
   FontFamily,
   TeacherLessonCommand,
   FlowchartEdge,
@@ -59,72 +59,10 @@ interface WeatherResponse {
 const MAX_PROMPT_LENGTH = 3000;
 const MAX_CONTEXT_LENGTH = 18000;
 
-const ADDITIVE_IMAGE_WORDS =
-  /\b(add|place|put|include|beside|next to|alongside|append)\b/i;
-
-function isAdditiveImageRequest(
-  prompt: string,
-  hasBoardImage: boolean,
-): boolean {
-  return hasBoardImage && ADDITIVE_IMAGE_WORDS.test(prompt);
-}
-
-const GEMINI_TEXT_MODELS = uniqueModels([
-  "gemini-3.1-flash-lite",
-  process.env.GEMINI_MODEL,
-  "gemini-3.5-flash-lite",
-  "gemini-flash-lite-latest",
-  "gemini-3.5-flash",
-  "gemini-3.6-flash",
-]);
-
-function uniqueModels(models: Array<string | undefined>): string[] {
-  const seen = new Set<string>();
-  const names: string[] = [];
-  for (const model of models) {
-    const name = model?.trim();
-    if (!name || seen.has(name)) continue;
-    seen.add(name);
-    names.push(name);
-  }
-  return names;
-}
-
-function isRetryableGeminiError(error: unknown): boolean {
-  const status = Number((error as { status?: number })?.status);
-  const message = error instanceof Error ? error.message : String(error);
-  return (
-    status === 503 ||
-    status === 429 ||
-    status === 404 ||
-    /UNAVAILABLE|high demand|overloaded|try again later|resource exhausted|no longer available|NOT_FOUND/i.test(
-      message,
-    )
-  );
-}
-
-function isGeminiUnavailable(error: unknown): boolean {
-  const status = Number((error as { status?: number })?.status);
-  const message = error instanceof Error ? error.message : String(error);
-  return (
-    status === 503 ||
-    status === 429 ||
-    /UNAVAILABLE|high demand|overloaded|try again later|resource exhausted/i.test(
-      message,
-    )
-  );
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
 const writeTextDeclaration: FunctionDeclaration = {
   name: "write_text",
   description:
-    "Write concise key points on the whiteboard for a short factual answer or when the user explicitly asks for text only/on the board. For explanations, teaching, or help understanding a concept, use teach_lesson so the voice gives the fuller explanation while the board shows only the important points. For a follow-up edit to existing text, return the COMPLETE updated text content, not only the change.",
+    "Write concise key points on the whiteboard for a short factual answer or when the user explicitly asks for text only/on the board. For explanations, teaching, or help understanding a concept, use teach_lesson so the voice gives the fuller explanation while the board shows only the important points. For small edits to existing text, use edit_text and return only the requested change.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -157,7 +95,7 @@ const writeTextDeclaration: FunctionDeclaration = {
         type: "string",
         enum: ["sans-serif", "serif", "monospace", "handwriting", "cursive"],
         description:
-          "Font family for the text. Default is sans-serif. Available fonts: sans-serif, serif, monospace, handwriting, cursive.",
+          "Font family for the text. Default to handwriting unless the user explicitly asks for another font. Available fonts: sans-serif, serif, monospace, handwriting, cursive.",
       },
       backgroundColor: {
         type: "string",
@@ -243,6 +181,43 @@ const manageBoardDeclaration: FunctionDeclaration = {
   },
 };
 
+const editTextDeclaration: FunctionDeclaration = {
+  name: "edit_text",
+  description:
+    "Make a small, in-place change to existing board text. Return only requested additions, a mark, or an explanation; never rewrite existing text.",
+  parametersJsonSchema: {
+    type: "object",
+    properties: {
+      action: {
+        type: "string",
+        enum: ["append_points", "mark", "explain"],
+      },
+      points: {
+        type: "array",
+        items: { type: "string" },
+        description: "Only the new points to add.",
+      },
+      target: {
+        type: "string",
+        description: "Exact existing phrase to mark or explain.",
+      },
+      style: {
+        type: "string",
+        enum: ["underline", "circle", "color"],
+      },
+      color: {
+        type: "string",
+        description: "Six-digit hex color for a color mark, such as #FF0000.",
+      },
+      explanation: {
+        type: "string",
+        description: "Concise explanation of the target phrase.",
+      },
+    },
+    required: ["action"],
+  },
+};
+
 const teachLessonDeclaration: FunctionDeclaration = {
   name: "teach_lesson",
   description:
@@ -292,18 +267,17 @@ const teachLessonDeclaration: FunctionDeclaration = {
               description:
                 "Optional worked example, key takeaway, or short teacher note visible on the board.",
             },
-              backgroundColor: { type: "string", description: "Optional six-digit hex background color." },
-              titleColor: { type: "string", description: "Optional six-digit hex title color." },
-              textColor: { type: "string", description: "Optional six-digit hex bullet and note color." },
-              bold: { type: "boolean", description: "Make board text bold." },
-              italic: { type: "boolean", description: "Make board text italic." },
-              underline: { type: "boolean", description: "Underline board text." },
-              writingSpeed: { type: "number", description: "Writing speed from 10 (slow) to 100 (fast)." },
-              drawingSpeed: { type: "number", description: "Drawing speed from 10 (slow) to 100 (fast)." },
+            backgroundColor: { type: "string", description: "Optional six-digit hex background color." },
+            titleColor: { type: "string", description: "Optional six-digit hex title color." },
+            textColor: { type: "string", description: "Optional six-digit hex bullet and note color." },
+            bold: { type: "boolean", description: "Make board text bold." },
+            italic: { type: "boolean", description: "Make board text italic." },
+            underline: { type: "boolean", description: "Underline board text." },
+            writingSpeed: { type: "number", description: "Writing speed from 10 (slow) to 100 (fast)." },
+            drawingSpeed: { type: "number", description: "Drawing speed from 10 (slow) to 100 (fast)." },
             gesture: {
               type: "string",
               enum: [
-                "none",
                 "continue",
                 "wave",
                 "goodbye",
@@ -329,30 +303,7 @@ const teachLessonDeclaration: FunctionDeclaration = {
                 "together",
               ],
               description:
-                "Body gesture Mike performs while speaking this segment. Pick the one matching the narration's intent: 'welcome' or 'ready' to open a lesson, 'explain' for how something works, 'emphasize' for key points, 'point' when directing attention to the board, 'reveal' for results, 'contrast' for however/alternatives, 'next' when moving to a new part, 'approve' for praise, 'goodbye' to close. Use 'none' when Mike should simply talk with his hands at rest (transitions, short conversational lines, follow-up sentences that continue a thought). Real presenters gesture on roughly two thirds of what they say, so about one segment in three should be 'none'.",
-            },
-            emotion: {
-              type: "string",
-              enum: [
-                "neutral",
-                "attentive",
-                "happy",
-                "encouraging",
-                "amused",
-                "surprised",
-                "thinking",
-                "concerned",
-                "serious",
-                "angry",
-              ],
-              description:
-                "Facial expression Mike wears while speaking this segment. 'encouraging' for openings and praise, 'happy' for good news or a correct idea, 'amused' for a light joke or fun fact, 'surprised' for a striking result or counter-intuitive fact, 'thinking' when posing a question or working through a step, 'concerned' for a common mistake or pitfall, 'serious' for a key rule or warning, 'angry' only when the lesson content itself calls for it. Use 'attentive' for plain explanation.",
-            },
-            reaction: {
-              type: "string",
-              enum: ["none", "laugh", "hm", "surprise", "nod", "shrug"],
-              description:
-                "Optional short physical reaction right before this segment: 'laugh' for a joke or fun aside, 'hm' when pausing to think, 'surprise' for a striking fact, 'nod' to affirm the student, 'shrug' for 'it depends' / nobody knows. Most segments should be 'none' or omitted; at most one or two reactions per lesson.",
+                "Body gesture Mike performs while speaking this segment. Pick the one matching the narration's intent: 'welcome' or 'ready' to open a lesson, 'explain' for how something works, 'emphasize' for key points, 'point' when directing attention to the board, 'reveal' for results, 'contrast' for however/alternatives, 'next' when moving to a new part, 'approve' for praise, 'goodbye' to close. Use 'continue' when no distinct gesture fits.",
             },
           },
           required: ["narration", "boardTitle", "boardBullets"],
@@ -469,7 +420,7 @@ const plotWeatherHistoryDeclaration: FunctionDeclaration = {
 const generateImageDeclaration: FunctionDeclaration = {
   name: "generate_image",
   description:
-    "Generate a new image for the whiteboard. By default, make it look like a hand-drawn whiteboard doodle or marker sketch. Only make it realistic/photo-like when the user explicitly asks for realistic, photo, or photorealistic style. Use this for requests such as draw/show/create/generate a cat, dog, person, object, scene, or other visual that should be an image rather than a flowchart or simple text answer. If the user asks to explain and draw, include a fuller explanation; if they only ask to draw something, include a very short description of the subject.",
+    "Generate a new image for the board. By default, make it look like a hand-drawn on a board doodle or marker sketch. Only make it realistic/photo-like when the user explicitly asks for realistic, photo, or photorealistic style. Use this for requests such as draw/show/create/generate a cat, dog, person, object, scene, or other visual that should be an image rather than a flowchart or simple text answer. If the user asks to explain and draw, include a fuller explanation; if they only ask to draw something, include a very short description of the subject.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -496,7 +447,7 @@ const generateImageDeclaration: FunctionDeclaration = {
 const editBoardImageDeclaration: FunctionDeclaration = {
   name: "edit_board_image",
   description:
-    "Edit the CURRENT visible whiteboard image. By default, preserve or create a hand-drawn whiteboard doodle/marker-sketch look unless the user explicitly asks for realistic/photo style. Use this for visual follow-ups such as add a dog beside that cat, remove the tree, change its color, make the cat bigger, move it left, or otherwise modify an image already on the board. Preserve everything the user did not ask to change. If the user asks to explain and draw, include a fuller explanation; if they only ask to draw, include a short description of the final result.",
+    "Edit the CURRENT visible board image. By default, preserve or create a hand-drawn whiteboard doodle/marker-sketch look unless the user explicitly asks for realistic/photo style. Use this for visual follow-ups such as add a dog beside that cat, remove the tree, change its color, make the cat bigger, move it left, or otherwise modify an image already on the board. Preserve everything the user did not ask to change. If the user asks to explain and draw, include a fuller explanation; if they only ask to draw, include a short description of the final result.",
   parametersJsonSchema: {
     type: "object",
     properties: {
@@ -598,16 +549,16 @@ function buildTextCommand(
 
   const bullets = Array.isArray(args.bullets)
     ? args.bullets
-        .map((item) => readString(item, "", 190))
-        .filter(Boolean)
-        .slice(0, 8)
+      .map((item) => readString(item, "", 190))
+      .filter(Boolean)
+      .slice(0, 8)
     : [];
 
   const formulas = Array.isArray(args.formulas)
     ? args.formulas
-        .map((item) => readString(item, "", 120))
-        .filter(Boolean)
-        .slice(0, 4)
+      .map((item) => readString(item, "", 120))
+      .filter(Boolean)
+      .slice(0, 4)
     : [];
 
   const note = readString(args.note, "", 220);
@@ -626,7 +577,7 @@ function buildTextCommand(
     bullets:
       bullets.length > 0
         ? bullets
-        : ["No whiteboard content was returned."],
+        : ["No board content was returned."],
     ...(formulas.length > 0 ? { formulas } : {}),
     ...(note ? { note } : {}),
     ...(font ? { font } : {}),
@@ -661,16 +612,16 @@ function buildTeacherLessonCommand(
 
       const bullets = Array.isArray(segment.boardBullets)
         ? segment.boardBullets
-            .map((item) => readString(item, "", 180))
-            .filter(Boolean)
-            .slice(0, 7)
+          .map((item) => readString(item, "", 180))
+          .filter(Boolean)
+          .slice(0, 7)
         : [];
 
       const formulas = Array.isArray(segment.formulas)
         ? segment.formulas
-            .map((item) => readString(item, "", 120))
-            .filter(Boolean)
-            .slice(0, 4)
+          .map((item) => readString(item, "", 120))
+          .filter(Boolean)
+          .slice(0, 4)
         : [];
 
       const note = readString(segment.note, "", 220);
@@ -678,16 +629,10 @@ function buildTeacherLessonCommand(
 
       const gesture = readString(segment.gesture, "", 24)
         .toLowerCase();
-      const emotion = readString(segment.emotion, "", 24)
-        .toLowerCase();
-      const reaction = readString(segment.reaction, "", 24)
-        .toLowerCase();
 
       return {
         narration,
         ...(gesture ? { gesture } : {}),
-        ...(emotion ? { emotion } : {}),
-        ...(reaction && reaction !== "none" ? { reaction } : {}),
         board: {
           type: "write_text" as const,
           title: readString(
@@ -699,10 +644,10 @@ function buildTeacherLessonCommand(
             bullets.length > 0
               ? bullets
               : [
-                  index === 0
-                    ? "Introduction to " + topic
-                    : "Continue learning " + topic,
-                ],
+                index === 0
+                  ? "Introduction to " + topic
+                  : "Continue learning " + topic,
+              ],
           ...(formulas.length > 0 ? { formulas } : {}),
           ...(note ? { note } : {}),
           ...(formatting ? { formatting } : {}),
@@ -1099,10 +1044,10 @@ async function buildImageCommand(
 
   const currentStyle =
     currentCommand?.type === "image" &&
-    currentCommand.style === "realistic"
+      currentCommand.style === "realistic"
       ? "realistic"
       : currentCommand?.type === "image" &&
-          currentCommand.style === "doodle"
+        currentCommand.style === "doodle"
         ? "doodle"
         : null;
 
@@ -1121,27 +1066,27 @@ async function buildImageCommand(
 
   const styleInstructions = prefersRealistic
     ? [
-        "Style: realistic / photo-like.",
-        "Render the subject convincingly with natural form and detail.",
-      ].join("\n")
+      "Style: realistic / photo-like.",
+      "Render the subject convincingly with natural form and detail.",
+    ].join("\n")
     : [
-        "Style: simple classroom whiteboard marker drawing.",
-        "Use bold clean dark marker outlines on a solid pure-white (#FFFFFF) background.",
-        "Return the image as PNG; do not use transparency.",
-        "Prioritize a clear recognizable silhouette first, then add only a few important interior details.",
-        "Make cartoon characters and animals easy to recognize from a distance.",
-        "Use loose hand-drawn contours with occasional retraced lines, small overshoots, and slight wobble.",
-        "Keep the drawing simple and readable: avoid tiny details, clutter, dense hatching, or broken fragmented lines.",
-        "Do not use gradients, shadows, photographic texture, or large filled areas.",
-        "Keep the background plain pure white with no floor, sky, scenery, setting, or other decoration.",
-        "Do not add text, labels, borders, watermarks, captions, logos, signatures, board names, or poster-like layouts.",
-        "The final result should look like a teacher quickly sketched it with a black dry-erase marker.",
-      ].join("\n");
+      "Style: simple classroom board marker drawing.",
+      "Use bold clean dark marker outlines on a solid pure-white (#FFFFFF) background.",
+      "Return the image as PNG; do not use transparency.",
+      "Prioritize a clear recognizable silhouette first, then add only a few important interior details.",
+      "Make cartoon characters and animals easy to recognize from a distance.",
+      "Use loose hand-drawn contours with occasional retraced lines, small overshoots, and slight wobble.",
+      "Keep the drawing simple and readable: avoid tiny details, clutter, dense hatching, or broken fragmented lines.",
+      "Do not use gradients, shadows, photographic texture, or large filled areas.",
+      "Keep the background plain pure white with no floor, sky, scenery, setting, or other decoration.",
+      "Do not add text, labels, borders, watermarks, or a poster-like layout.",
+      "The final result should look like a teacher quickly sketched it with a black dry-erase marker.",
+    ].join("\n");
 
   const imageInstructions =
     mode === "edit"
       ? `
-Edit the attached current whiteboard image according to this instruction:
+Edit the attached current board image according to this instruction:
 ${requestedText}
 
 ${styleInstructions}
@@ -1153,12 +1098,12 @@ Rules:
 - Do not replace, restyle, or distort unrelated content.
 - If adding an object, place it naturally without covering important existing content.
 - ${prefersRealistic ? "Preserve the existing background treatment." : "Use an opaque pure-white background; do not leave transparent areas."}
-- If the current board already looks hand-drawn, continue in the same whiteboard-doodle style unless the user explicitly asks for realistic style.
-- Do not add new text, labels, borders, watermarks, captions, logos, signatures, or board names unless the user explicitly requests that exact content.
-- Return the COMPLETE updated board as PNG, including all existing content and the requested addition. Do not return only a partial overlay or a standalone new object.
+- If the current board already looks hand-drawn, continue in the same board-doodle style unless the user explicitly asks for realistic style.
+- Do not add new text, labels, borders, watermarks, or captions unless explicitly requested.
+- Return only the edited image as PNG.
       `.trim()
       : `
-Create an image for display on a 16:9 interactive teaching whiteboard.
+Create an image for display on a 16:9 interactive teaching board.
 
 User request:
 ${requestedText}
@@ -1166,12 +1111,12 @@ ${requestedText}
 ${styleInstructions}
 
 Rules:
-- Compose the subject clearly with comfortable margins so it looks good on a whiteboard.
-- Keep the subject large enough and visually simple enough to remain recognizable after whiteboard rendering.
-- Avoid unnecessary text, labels, frames, watermarks, captions, logos, signatures, or board names.
+- Compose the subject clearly with comfortable margins so it looks good on a board.
+- Keep the subject large enough and visually simple enough to remain recognizable after board rendering.
+- Avoid unnecessary text, labels, frames, watermarks, or captions.
 - ${prefersRealistic ? "Follow the requested scene and background, avoiding unrelated decoration." : "Draw only the requested subject on a plain pure-white background. Do not add scenery, ground, sky, shadows, props, or decorative background elements."}
 - ${prefersRealistic ? "Use a background or setting when the user's request names one." : "Include a background or setting only when the user's request explicitly names one, and then show only the requested subject with that setting."}
-- Return only the generated image as PNG. Do not reproduce the board's title, brand, signature, or watermark.
+- Return only the generated image as PNG.
       `.trim();
 
   const imageParts: Part[] = [{ text: imageInstructions }];
@@ -1192,6 +1137,8 @@ Rules:
     ],
     config: {
       responseModalities: ["IMAGE"],
+      // `responseFormat` is not part of GenerateContentConfig in
+      // @google/genai; aspect ratio goes through imageConfig.
       imageConfig: {
         aspectRatio: "16:9",
       },
@@ -1339,6 +1286,14 @@ export async function POST(request: Request) {
       currentCommandValue,
     );
 
+    const isAdditiveImageRequest =
+      Boolean(boardImagePart) &&
+      /\b(add|place|put|include|beside|next to|alongside)\b/i.test(prompt);
+    const isExplicitDrawAndExplainRequest =
+      /\b(draw|sketch|illustrate)\b/i.test(prompt) &&
+      /\b(explain|describe)\b/i.test(prompt) &&
+      !isAdditiveImageRequest;
+
     const routerInstructions = `
 You are the fast tool router for Lixia, an interactive teaching whiteboard.
 
@@ -1346,15 +1301,17 @@ You MUST call exactly one available function.
 Do not answer with normal prose.
 
 ROUTING RULES:
-- teach_lesson: any request to explain, teach, learn, understand, walk through, define a concept, solve a problem, or give a lesson. The voice must give the fuller teacher-style explanation and the board must progressively show only the important points, definitions, formulas, and examples.
+- edit_text: when the current board is text and the user asks to add a point, underline/circle/color a specific existing phrase, or explain a specific phrase already on the board. Return only the requested patch, never the complete board. Use the exact phrase as target. For a color mark, provide a six-digit hex color.
+- teach_lesson: any request to explain, teach, learn, understand, walk through, define a concept, solve a problem, or give a lesson, except a request to explain one specific phrase already on the current text board (use edit_text for that). The voice must give the fuller teacher-style explanation and the board must progressively show only the important points, definitions, formulas, and examples.
 - Use teach_lesson by default for educational questions, even when the user asks a short definition, unless they explicitly ask for a brief answer, text only, or board-only response.
 - write_text: short direct answers or concise key points when the user explicitly wants a brief answer, text only, or board-only content. Do not use it for a teaching explanation when narration would help.
 - draw_flowchart: flowcharts, workflows, processes, decision trees, sequences with arrows.
 - plot_weather_history: REAL recent weather graphs/charts for a real location. This tool fetches live/recent Open-Meteo data, so never invent weather numbers yourself.
-- generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn whiteboard doodle/marker sketch unless the user explicitly asks for realistic/photo style.
-- edit_board_image: modify a visual already visible on the board, including a specific part of it, for example "change the leaf", "make the flower petals red", "add a dog beside that cat", "remove the tree", or "make the cat bigger". Use this for any follow-up that says change, edit, remove, add to, recolor, resize, move, or otherwise adjust something in the existing drawing. By default, preserve or continue a hand-drawn whiteboard doodle style unless the user explicitly asks for realistic/photo style.
+- generate_image: create a NEW visual such as a cat, dog, car, person, object, landscape, or scene. By default, this should look like a hand-drawn on board doodle/marker sketch unless the user explicitly asks for realistic/photo style.
+- edit_board_image: modify a visual already visible on the board, including a specific part of it, for example "change the leaf", "make the flower petals red", "add a dog beside that cat", "remove the tree", or "make the cat bigger". Use this for any follow-up that says change, edit, remove, add to, recolor, resize, move, or otherwise adjust something in the existing drawing. By default, preserve or continue a hand-drawn board doodle style unless the user explicitly asks for realistic/photo style.
 - If the user asks only to explain or describe the existing picture, use write_text and do not create or edit an image. Inspect the attached board image and explain what is visible.
 - If the user asks to explain and draw, explain with drawing, or describe and draw, use the image tool and include a fuller explanation field covering the subject and important parts.
+- An explicit request to draw/sketch/illustrate AND explain must create an image, even though it also asks for an explanation. Do not route it to teach_lesson or write_text.
 - If the user only says draw, sketch, create, or show something, still include a very short explanation field such as "A simple sketch of a cat." so the assistant can briefly describe the drawing after it is created.
 - manage_board: create/add a new board, select/open an existing board, delete/remove the current board, clear the current board, or restore content cleared earlier. Use restore when the user says redo, bring it back, undo the clear, or restore what was there before. For select, match the user's requested board by its name, ID, or content in the available board list, then return that board's boardId. For create, include concise initial content in the same tool call.
 
@@ -1370,7 +1327,7 @@ BOARD CONTEXT:
 - For weather requests such as "KTM", normalize the location to a geocodable place name such as "Kathmandu, Nepal" when you are confident.
 - "last 10 days till today" means days=10.
 - For object/animal/person drawings, NEVER fake them with text, SVG, or a flowchart. Use generate_image or edit_board_image.
-- Default image style should be a whiteboard doodle / marker sketch. Only choose realistic/photo style when the user clearly asks for it.
+- Default image style should be a board doodle / marker sketch. Only choose realistic/photo style when the user clearly asks for it.
 - Use edit_board_image only when the request refers to visual content already on the current board.
 - For teach_lesson, make every segment board state cumulative: later segments must keep useful content/formulas from earlier segments while adding the next idea.
 - Keep teach_lesson narration conversational and substantially more detailed than the board. The voice should explain reasoning and examples like a teacher, not read the board word-for-word. The board is a concise visual summary containing only important information.
@@ -1378,17 +1335,14 @@ BOARD CONTEXT:
 - For formulas, put symbolic notation on the board, but phrase the narration naturally. Example: board shows "a = Δv / Δt" while narration says "acceleration equals change in velocity divided by change in time."
 - Prefer 3-5 lesson segments so the learner sees the board develop step by step.
 - For teach_lesson, give every segment a gesture that matches its narration. Vary the gestures across the lesson: typically open with welcome/ready, use explain/point/emphasize in the middle, and end with approve/goodbye. Do not repeat the same gesture in consecutive segments unless it clearly fits.
-- Not every line needs a gesture. Roughly one segment in three should use gesture "none": transitions, short conversational lines, and sentences that just continue the previous thought. Save point/emphasize/reveal for the moments that matter so they land.
-- For teach_lesson, also give every segment an emotion that matches the tone of its narration. Most segments are 'attentive'; open with 'encouraging'; use 'surprised' for a striking or counter-intuitive fact, 'thinking' when posing a question, 'concerned' for a common mistake, 'serious' for a rule that must not be broken, 'amused' for a light aside, and 'happy' when celebrating a result. Do not use 'angry' unless the content itself is about anger or the user asks for it.
-- A segment may also carry a reaction ('laugh', 'hm', 'surprise', 'nod', 'shrug'): a short physical beat before Mike speaks it. Use these sparingly, one or two per lesson at most, where a human teacher would visibly react: a chuckle before a fun aside, a 'hm' before a tricky question, a 'surprise' before a striking fact.
 
 FONT MANAGEMENT:
-- Default font is "sans-serif" - a clean, modern font suitable for most content.
+- Default font is "handwriting" for all board text unless the user explicitly requests another font.
 - When the user asks to change the font, use the "font" parameter in write_text with one of these options:
-  * "sans-serif" - Clean, modern, default font (Segoe UI, Arial)
+  * "sans-serif" - Clean, modern alternative (Segoe UI, Arial)
   * "serif" - Traditional, formal font (Georgia, Times New Roman)
   * "monospace" - Fixed-width font for code or technical content (Courier New)
-  * "handwriting" - Playful, handwritten style (Lixia Handwriting, Comic Sans MS)
+  * "handwriting" - Playful, handwritten style (Lixia Handwriting, Comic Sans MS); this is the default
   * "cursive" - Elegant, flowing script font (Brush Script MT)
 - When changing fonts, return the complete updated board content with all existing text and the new font applied.
 - If the user asks what fonts are available, use write_text to show them this list.
@@ -1433,82 +1387,89 @@ ${prompt}
     parts.push({ text: routerInstructions });
 
     const ai = new GoogleGenAI({ apiKey });
-    const generateConfig: GenerateContentConfig = {
-      temperature: 0.1,
-      tools: [
+
+    const response = await ai.models.generateContent({
+      model:
+        process.env.GEMINI_MODEL ??
+        "gemini-3.5-flash-lite",
+      contents: [
         {
-          functionDeclarations: [
-            writeTextDeclaration,
-            manageBoardDeclaration,
-            teachLessonDeclaration,
-            drawFlowchartDeclaration,
-            plotWeatherHistoryDeclaration,
-            generateImageDeclaration,
-            editBoardImageDeclaration,
-          ],
+          role: "user",
+          parts,
         },
       ],
-      toolConfig: {
-        functionCallingConfig: {
-          mode: FunctionCallingConfigMode.ANY,
+      config: {
+        temperature: 0.1,
+        tools: [
+          {
+            functionDeclarations: [
+              writeTextDeclaration,
+              editTextDeclaration,
+              manageBoardDeclaration,
+              teachLessonDeclaration,
+              drawFlowchartDeclaration,
+              plotWeatherHistoryDeclaration,
+              generateImageDeclaration,
+              editBoardImageDeclaration,
+            ],
+          },
+        ],
+        toolConfig: {
+          functionCallingConfig: {
+            mode: FunctionCallingConfigMode.ANY,
+          },
         },
       },
-    };
-
-    const textOnlyParts: Part[] = [{ text: routerInstructions }];
-    const partAttempts = boardImagePart ? [parts, textOnlyParts] : [parts];
-
-    let response: Awaited<
-      ReturnType<GoogleGenAI["models"]["generateContent"]>
-    > | undefined;
-    let lastError: unknown;
-
-    for (const attemptParts of partAttempts) {
-      for (const model of GEMINI_TEXT_MODELS) {
-        try {
-          response = await ai.models.generateContent({
-            model,
-            contents: [
-              {
-                role: "user",
-                parts: attemptParts,
-              },
-            ],
-            config: generateConfig,
-          });
-          if (
-            model !== process.env.GEMINI_MODEL ||
-            attemptParts === textOnlyParts
-          ) {
-            console.info(
-              `Gemini recovered with ${model}${
-                attemptParts === textOnlyParts ? " (text only)" : ""
-              }`,
-            );
-          }
-          break;
-        } catch (error) {
-          lastError = error;
-          if (!isRetryableGeminiError(error)) throw error;
-          const status = Number((error as { status?: number })?.status);
-          console.warn(
-            `Gemini ${model} failed (${status || "retryable"}), trying next.`,
-          );
-          if (status !== 404) {
-            await sleep(350);
-          }
-        }
-      }
-      if (response) break;
-    }
-
-    if (!response) {
-      throw lastError instanceof Error
-        ? lastError
-        : new Error("Gemini is temporarily unavailable.");
-    }
+    });
 
     const functionCall = response.functionCalls?.[0];
+    const args =
+      functionCall?.args && typeof functionCall.args === "object"
+        ? (functionCall.args as Record<string, unknown>)
+        : {};
+
+    if (isExplicitDrawAndExplainRequest) {
+      const segmentNarration = Array.isArray(args.segments)
+        ? args.segments
+          .map((segment) =>
+            segment && typeof segment === "object"
+              ? readString(
+                (segment as Record<string, unknown>).narration,
+                "",
+                450,
+              )
+              : "",
+          )
+          .filter(Boolean)
+          .join(" ")
+        : "";
+      const boardSummary = [
+        readString(args.title, "", 120),
+        ...(Array.isArray(args.bullets)
+          ? args.bullets.map((bullet) => readString(bullet, "", 180))
+          : []),
+      ]
+        .filter(Boolean)
+        .join(". ");
+      const explanation =
+        readString(args.explanation, "", 900) ||
+        readString(segmentNarration || boardSummary, "", 900);
+      const command = await buildImageCommand(
+        ai,
+        {
+          prompt: readString(args.prompt, prompt, 1200),
+          ...(explanation ? { explanation } : {}),
+        },
+        "create",
+        null,
+        currentCommandValue,
+      );
+
+      return NextResponse.json({
+        tool: "generate_image",
+        command,
+      });
+    }
 
     if (!functionCall) {
       const fallbackText = response.text?.trim();
@@ -1532,26 +1493,61 @@ ${prompt}
       );
     }
 
-    const args =
-      functionCall.args && typeof functionCall.args === "object"
-        ? (functionCall.args as Record<string, unknown>)
-        : {};
+    if (functionCall.name === "edit_text") {
+      const action = readString(args.action, "", 24);
+      if (action !== "append_points" && action !== "mark" && action !== "explain") {
+        throw new Error("Gemini returned an invalid text edit action.");
+      }
 
-    const additiveRequest = isAdditiveImageRequest(
-      prompt,
-      Boolean(boardImagePart),
-    );
+      const edit: BoardTextEdit = { action };
+      if (action === "append_points") {
+        edit.points = Array.isArray(args.points)
+          ? args.points.map((point) => readString(point, "", 180)).filter(Boolean).slice(0, 4)
+          : [];
+        if (edit.points.length === 0) {
+          throw new Error("No new board points were provided.");
+        }
+      } else {
+        edit.target = readString(args.target, "", 180);
+        if (!edit.target) {
+          throw new Error("No existing text was selected for the edit.");
+        }
+
+        if (action === "mark") {
+          const style = readString(args.style, "", 16);
+          if (style !== "underline" && style !== "circle" && style !== "color") {
+            throw new Error("Gemini returned an invalid text mark style.");
+          }
+          edit.style = style;
+          if (style === "color") {
+            const color = readString(args.color, "", 7);
+            if (!/^#[0-9a-fA-F]{6}$/.test(color)) {
+              throw new Error("A six-digit hex color is required.");
+            }
+            edit.color = color;
+          }
+        } else {
+          edit.explanation = readString(args.explanation, "", 450);
+          if (!edit.explanation) {
+            throw new Error("No explanation was provided.");
+          }
+        }
+      }
+
+      return NextResponse.json({ tool: "edit_text", textEdit: edit });
+    }
 
     const shouldEditExistingImage =
       functionCall.name === "edit_board_image" ||
-      additiveRequest;
+      (functionCall.name === "generate_image" && isAdditiveImageRequest);
 
-    const imageEditArgs = additiveRequest
-      ? {
+    const imageEditArgs =
+      functionCall.name === "generate_image" && isAdditiveImageRequest
+        ? {
           ...args,
           instruction: readString(args.prompt, prompt, 1200),
         }
-      : args;
+        : args;
 
     let command: BoardCommand | TeacherLessonCommand | BoardManagementCommand;
 
@@ -1576,35 +1572,35 @@ ${prompt}
           : {}),
         ...(action === "select"
           ? {
-              ...(readNumber(args.boardId, 0) > 0
-                ? { boardId: readNumber(args.boardId, 0) }
-                : {}),
-              ...(readString(args.boardName, "", 120)
-                ? { boardName: readString(args.boardName, "", 120) }
-                : {}),
-            }
+            ...(readNumber(args.boardId, 0) > 0
+              ? { boardId: readNumber(args.boardId, 0) }
+              : {}),
+            ...(readString(args.boardName, "", 120)
+              ? { boardName: readString(args.boardName, "", 120) }
+              : {}),
+          }
           : {}),
         ...(action === "create"
           ? {
-              title: readString(args.title, "New board", 90),
-              bullets: Array.isArray(args.bullets)
-                ? args.bullets
-                    .map((bullet) => readString(bullet, "", 180))
-                    .filter(Boolean)
-                    .slice(0, 8)
-                : [],
-              ...(Array.isArray(args.formulas)
-                ? {
-                    formulas: args.formulas
-                      .map((formula) => readString(formula, "", 120))
-                      .filter(Boolean)
-                      .slice(0, 4),
-                  }
-                : {}),
-              ...(readString(args.note, "", 240)
-                ? { note: readString(args.note, "", 240) }
-                : {}),
-            }
+            title: readString(args.title, "New board", 90),
+            bullets: Array.isArray(args.bullets)
+              ? args.bullets
+                .map((bullet) => readString(bullet, "", 180))
+                .filter(Boolean)
+                .slice(0, 8)
+              : [],
+            ...(Array.isArray(args.formulas)
+              ? {
+                formulas: args.formulas
+                  .map((formula) => readString(formula, "", 120))
+                  .filter(Boolean)
+                  .slice(0, 4),
+              }
+              : {}),
+            ...(readString(args.note, "", 240)
+              ? { note: readString(args.note, "", 240) }
+              : {}),
+          }
           : {}),
       };
     } else if (functionCall.name === "write_text") {
@@ -1651,16 +1647,6 @@ ${prompt}
     });
   } catch (error) {
     console.error("Gemini tool router error:", error);
-
-    if (isGeminiUnavailable(error)) {
-      return NextResponse.json(
-        {
-          error:
-            "Gemini is busy right now. Press Send again — a fallback model will be tried.",
-        },
-        { status: 503 },
-      );
-    }
 
     const message =
       error instanceof Error
